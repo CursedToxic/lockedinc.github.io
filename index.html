@@ -41,7 +41,7 @@
   <div id="root"></div>
 
   <script type="module">
-    const res = await fetch("./se_bootbamp.jsx", { cache: "no-store" });
+    const res = await fetch("./se_bootbamp.jsx?v=" + Date.now(), { cache: "no-store" });
     if (!res.ok) {
       document.getElementById("root").innerHTML =
         "<pre style='color:#f85149;padding:24px;font-family:monospace'>Could not load se_bootbamp.jsx (" +
