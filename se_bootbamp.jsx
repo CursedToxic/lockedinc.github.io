@@ -795,7 +795,9 @@ export default function SEBootcamp() {
         const aiQuestions = await generateAiQuestions(apiKey, mod, node, node.questions.length, syllabusText);
         beginRun(aiQuestions);
       } catch (e) {
-        setGenError(e && e.message ? e.message : "Failed to generate AI questions.");
+        console.error("AI question generation failed:", e);
+        const detail = e && (e.message || e.name) ? `${e.name || "Error"}: ${e.message || "(no message)"}` : "Failed to generate AI questions.";
+        setGenError(detail);
         beginRun(node.questions);
       }
       return;
