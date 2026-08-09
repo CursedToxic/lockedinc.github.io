@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>se//bootcamp</title>
+  <style>
+    html, body { margin: 0; padding: 0; background: #0a0e14; color: #e6edf3; }
+    #root { min-height: 100vh; }
+  </style>
+
+  <!-- Map bare import specifiers used inside se_bootbamp.jsx to real ESM builds -->
+  <script type="importmap">
+  {
+    "imports": {
+      "react": "https://esm.sh/react@18.3.1",
+      "react-dom/client": "https://esm.sh/react-dom@18.3.1/client",
+      "lucide-react": "https://esm.sh/lucide-react@0.460.0?external=react",
+      "openai": "https://esm.sh/openai",
+      "pdfjs-dist": "https://esm.sh/pdfjs-dist@4.7.76"
+    }
+  }
+  </script>
+
+  <!-- Babel standalone: only used to strip JSX in the browser, imports/exports are left untouched -->
+  <script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+
+  <!-- Minimal window.storage shim (the component expects an async KV store) backed by localStorage -->
+  <script>
+    window.storage = {
+      async get(key) {
+        return { value: localStorage.getItem(key) };
+      },
+      async set(key, value) {
+        localStorage.setItem(key, value);
+      },
+    };
+  </script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="module">
+    const res = await fetch("./se_bootbamp.jsx");
+    if (!res.ok) {
+      document.getElementById("root").innerHTML =
+        "<pre style='color:#f85149;padding:24px;font-family:monospace'>Could not load se_bootbamp.jsx (" +
+        res.status +
+        "). Serve this folder over http:// (not file://), e.g. `python3 -m http.server`.</pre>";
+      throw new Error("fetch failed: " + res.status);
+    }
+    const source = await res.text();
+    const { code } = Babel.transform(source, { presets: ["react"], filename: "se_bootbamp.jsx" });
+
+    const blob = new Blob([code], { type: "text/javascript" });
+    const url = URL.createObjectURL(blob);
+    const mod = await import(url);
+    URL.revokeObjectURL(url);
+
+    const React = (await import("react")).default;
+    const { createRoot } = await import("react-dom/client");
+
+    createRoot(document.getElementById("root")).render(React.createElement(mod.default));
+  </script>
+</body>
+</html>
