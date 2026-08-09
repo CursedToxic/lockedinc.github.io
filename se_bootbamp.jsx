@@ -518,11 +518,12 @@ const LEVEL_TITLES = [
 ];
 
 const STORAGE_KEY = "se-bootcamp-progress-v2";
-const API_KEY_STORAGE = "se-bootcamp-openai-key";
+const API_KEY_STORAGE = "se-bootcamp-groq-key";
 const AI_MODE_STORAGE = "se-bootcamp-ai-mode";
 const SYLLABUS_STORAGE = "se-bootcamp-syllabus-v1";
 const SYLLABUS_MAX_CHARS = 60000; // ~15k tokens — keeps prompt size and cost bounded
-const AI_QUESTION_MODEL = "gpt-5.2";
+const AI_QUESTION_MODEL = "openai/gpt-oss-20b";
+const GROQ_BASE_URL = "https://api.groq.com/openai/v1";
 const TIME_LIMIT = 20; // seconds per question
 
 function shuffledIndices(n) {
@@ -565,15 +566,16 @@ async function extractTextFromFile(file) {
 }
 
 /**
- * Calls the OpenAI API directly from the browser to generate a fresh batch of
- * multiple-choice questions for a node, styled after its existing bank and,
- * when provided, grounded in the user's own uploaded syllabus text. The
- * user's own API key is stored only in localStorage and never leaves their
- * machine except in requests to OpenAI.
+ * Calls Groq's OpenAI-compatible API directly from the browser to generate a
+ * fresh batch of multiple-choice questions for a node, styled after its
+ * existing bank and, when provided, grounded in the user's own uploaded
+ * syllabus text. Groq serves the free, open-weight gpt-oss model used here.
+ * The user's own API key is stored only in localStorage and never leaves
+ * their machine except in requests to Groq.
  */
 async function generateAiQuestions(apiKey, mod, node, count, syllabusText) {
   const { default: OpenAI } = await import("openai");
-  const client = new OpenAI({ apiKey, dangerouslyAllowBrowser: true });
+  const client = new OpenAI({ apiKey, baseURL: GROQ_BASE_URL, dangerouslyAllowBrowser: true });
 
   const sample = node.questions.slice(0, 3).map((q) => ({ q: q.q, options: q.options, correct: q.correct }));
 
@@ -1099,7 +1101,7 @@ function AiSettingsPanel({ apiKey, aiMode, onSaveApiKey, onToggleAiMode, syllabu
         <Sparkles size={14} color="#f2cc60" /> AI-generated questions
       </div>
       <div style={{ ...S.mono, fontSize: 11, color: "#7d8590", lineHeight: 1.6, marginBottom: 14 }}>
-        Paste your own OpenAI API key to have {AI_QUESTION_MODEL} write a fresh batch of questions for a node every time you start it, instead of the built-in question bank. The key is stored only in this browser's local storage and is sent directly from your browser to OpenAI's API — never to any other server. Only use a key you control, on a device you trust.
+        Paste your own free Groq API key (get one at console.groq.com — no card required) to have {AI_QUESTION_MODEL}, a free open-weight model, write a fresh batch of questions for a node every time you start it, instead of the built-in question bank. The key is stored only in this browser's local storage and is sent directly from your browser to Groq's API — never to any other server. Only use a key you control, on a device you trust.
       </div>
 
       <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
@@ -1108,7 +1110,7 @@ function AiSettingsPanel({ apiKey, aiMode, onSaveApiKey, onToggleAiMode, syllabu
             type={showKey ? "text" : "password"}
             value={draft}
             onChange={(e) => { setDraft(e.target.value); setSaved(false); }}
-            placeholder="sk-…"
+            placeholder="gsk_…"
             style={{
               width: "100%", boxSizing: "border-box", ...S.mono, fontSize: 12, color: "#e6edf3",
               background: "#0d1219", border: "1px solid #232b36", borderRadius: 8,
