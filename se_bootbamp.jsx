@@ -521,7 +521,7 @@ const STORAGE_KEY = "se-bootcamp-progress-v2";
 const API_KEY_STORAGE = "se-bootcamp-groq-key";
 const AI_MODE_STORAGE = "se-bootcamp-ai-mode";
 const SYLLABUS_STORAGE = "se-bootcamp-syllabus-v1";
-const SYLLABUS_MAX_CHARS = 60000; // ~15k tokens — keeps prompt size and cost bounded
+const SYLLABUS_MAX_CHARS = 4000; // ~1k tokens — Groq's free on_demand tier caps gpt-oss-20b at 8000 tokens/min total
 const AI_QUESTION_MODEL = "openai/gpt-oss-20b";
 const GROQ_BASE_URL = "https://api.groq.com/openai/v1";
 const TIME_LIMIT = 20; // seconds per question
@@ -620,6 +620,7 @@ async function generateAiQuestions(apiKey, mod, node, count, syllabusText) {
     model: AI_QUESTION_MODEL,
     messages: [{ role: "user", content: prompt }],
     response_format: { type: "json_schema", json_schema: { name: "quiz_questions", strict: true, schema } },
+    max_completion_tokens: Math.min(4000, count * 220 + 300),
   });
 
   const raw = response.choices?.[0]?.message?.content;
