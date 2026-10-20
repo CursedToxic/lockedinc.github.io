@@ -41,7 +41,10 @@
   <div id="root"></div>
 
   <script type="module">
-    const res = await fetch("./se_bootbamp.jsx?v=" + Date.now(), { cache: "no-store" });
+    // Appended to every module request so GitHub Pages' CDN can't serve a stale copy.
+    const bust = "?v=" + Date.now();
+
+    const res = await fetch("./se_bootbamp.jsx" + bust, { cache: "no-store" });
     if (!res.ok) {
       document.getElementById("root").innerHTML =
         "<pre style='color:#f85149;padding:24px;font-family:monospace'>Could not load se_bootbamp.jsx (" +
@@ -52,7 +55,15 @@
     const source = await res.text();
     const { code } = Babel.transform(source, { presets: ["react"], filename: "se_bootbamp.jsx" });
 
-    const blob = new Blob([code], { type: "text/javascript" });
+    // The transformed source runs from a blob: URL, which has no useful base for
+    // resolving "./questions/*.js", so rewrite relative specifiers to absolute
+    // URLs (cache-busted) before importing. Bare specifiers are left for the import map.
+    const resolved = code.replace(
+      /(\bfrom\s*|\bimport\s*\(\s*)(["'])(\.{1,2}\/[^"']+)\2/g,
+      (_m, prefix, quote, spec) => prefix + quote + new URL(spec, location.href).href + bust + quote
+    );
+
+    const blob = new Blob([resolved], { type: "text/javascript" });
     const url = URL.createObjectURL(blob);
     const mod = await import(url);
     URL.revokeObjectURL(url);
