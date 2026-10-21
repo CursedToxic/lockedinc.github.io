@@ -3,8 +3,19 @@ import {
   Terminal, GitBranch, GitCommit, GitMerge, Cpu, Shield, Globe, Bot,
   FolderGit2, Braces, ChevronRight, RotateCcw, Trophy, Zap, Activity,
   CheckCircle2, XCircle, Lock, Star, ArrowLeft, Sparkles, Clock, Check,
-  Settings, Eye, EyeOff, Upload, FileText, X, Loader2
+  Settings, Eye, EyeOff, Upload, FileText, X, Loader2,
+  Users, UserPlus, Crown, Trash2, RefreshCw, Pencil, Medal
 } from "lucide-react";
+import { levelForXp, MAX_LEVEL } from "./lib/levels.js";
+import {
+  loadAccountState, saveAccountState, activeAccount, addAccount, switchAccount,
+  renameAccount, recolourAccount, removeAccount, setProgress, accountStats,
+  emptyProgress, initials, cleanName, PROFILE_COLOURS, MAX_NAME_LENGTH,
+} from "./lib/accounts.js";
+import {
+  loadLeaderboardConfig, saveLeaderboardConfig, isConfigured, fetchScores,
+  publishScore, entryForAccount, rankEntries, DEFAULT_CONFIG,
+} from "./lib/leaderboard.js";
 import { programmingFundamentalsNodes } from "./questions/programming-fundamentals.js";
 import { objectOrientedParadigmNodes } from "./questions/object-oriented-paradigm.js";
 import { programmingMechatronicsNodes } from "./questions/programming-mechatronics.js";
@@ -92,12 +103,6 @@ const MODULES = [
   },
 ];
 
-const LEVEL_TITLES = [
-  "Trainee", "Junior Dev", "Software Engineer", "Senior Engineer",
-  "Tech Lead", "Principal Engineer", "Systems Architect",
-];
-
-const STORAGE_KEY = "se-bootcamp-progress-v2";
 const API_KEY_STORAGE = "se-bootcamp-groq-key";
 const AI_MODE_STORAGE = "se-bootcamp-ai-mode";
 const SYLLABUS_STORAGE = "se-bootcamp-syllabus-v1";
@@ -224,13 +229,6 @@ async function generateAiQuestions(apiKey, mod, node, count, syllabusText) {
   return qs;
 }
 
-function levelForXp(xp) {
-  const level = Math.min(LEVEL_TITLES.length - 1, Math.floor(xp / 120));
-  const floor = level * 120;
-  const next = (level + 1) * 120;
-  return { level, title: LEVEL_TITLES[level], floor, next, pct: level >= LEVEL_TITLES.length - 1 ? 100 : Math.round(((xp - floor) / (next - floor)) * 100) };
-}
-
 function nodeKey(moduleId, nodeId) {
   return `${moduleId}::${nodeId}`;
 }
@@ -241,10 +239,18 @@ function nodeKey(moduleId, nodeId) {
 
 export default function SEBootcamp() {
   const [ready, setReady] = useState(false);
-  const [progress, setProgress] = useState({ xp: 0, best: {}, runs: 0 });
-  const [screen, setScreen] = useState("home"); // home | tree | quiz | result
+  const [accounts, setAccounts] = useState({ accounts: [], activeId: null });
+  const [screen, setScreen] = useState("home"); // home | tree | quiz | result | accounts | leaderboard
   const [activeModule, setActiveModule] = useState(null);
   const [activeNode, setActiveNode] = useState(null);
+  const [leveledUp, setLeveledUp] = useState(null);
+
+  // leaderboard
+  const [lbConfig, setLbConfig] = useState(DEFAULT_CONFIG);
+  const [lbEntries, setLbEntries] = useState([]);
+  const [lbLoading, setLbLoading] = useState(false);
+  const [lbError, setLbError] = useState(null);
+  const [lbPublishedAt, setLbPublishedAt] = useState(null);
 
   // quiz-in-progress state
   const [qIndex, setQIndex] = useState(0);
@@ -268,19 +274,25 @@ export default function SEBootcamp() {
   const [syllabusName, setSyllabusName] = useState("");
 
   const saveTimer = useRef(null);
+  const accountsRef = useRef(accounts);
+
+  const account = activeAccount(accounts);
+  const progress = account ? account.progress : emptyProgress();
 
   useEffect(() => {
     (async () => {
       try {
-        const res = await window.storage.get(STORAGE_KEY, false);
-        if (res && res.value) setProgress(JSON.parse(res.value));
+        const state = await loadAccountState();
+        accountsRef.current = state;
+        setAccounts(state);
       } catch (e) {
-        /* no saved progress yet */
+        /* no saved profiles yet — onboarding will create the first one */
       } finally {
         setReady(true);
       }
     })();
     try {
+      setLbConfig(loadLeaderboardConfig());
       const storedKey = localStorage.getItem(API_KEY_STORAGE);
       if (storedKey) setApiKey(storedKey);
       setAiMode(localStorage.getItem(AI_MODE_STORAGE) === "1");
@@ -329,17 +341,82 @@ export default function SEBootcamp() {
     saveSyllabus("", "");
   }
 
-  const persist = useCallback((next) => {
-    setProgress(next);
+  /* Every write goes through the whole profile file, so a save always records
+     which profile is active as well as its progress. */
+  const persistAccounts = useCallback((next) => {
+    accountsRef.current = next;
+    setAccounts(next);
     if (saveTimer.current) clearTimeout(saveTimer.current);
-    saveTimer.current = setTimeout(async () => {
-      try {
-        await window.storage.set(STORAGE_KEY, JSON.stringify(next), false);
-      } catch (e) {
-        /* ignore save failure */
-      }
+    saveTimer.current = setTimeout(() => {
+      saveAccountState(next).catch(() => {});
     }, 250);
   }, []);
+
+  const persist = useCallback((nextProgress) => {
+    const state = accountsRef.current;
+    if (!state.activeId) return;
+    persistAccounts(setProgress(state, state.activeId, nextProgress));
+  }, [persistAccounts]);
+
+  function createAccount(name, colour) {
+    persistAccounts(addAccount(accountsRef.current, name, colour));
+    setScreen("home");
+  }
+
+  function switchToAccount(id) {
+    persistAccounts(switchAccount(accountsRef.current, id));
+    setActiveModule(null);
+    setActiveNode(null);
+    setScreen("home");
+  }
+
+  function editAccountName(id, name) {
+    persistAccounts(renameAccount(accountsRef.current, id, name));
+  }
+
+  function editAccountColour(id, colour) {
+    persistAccounts(recolourAccount(accountsRef.current, id, colour));
+  }
+
+  function deleteAccount(id) {
+    persistAccounts(removeAccount(accountsRef.current, id));
+  }
+
+  function saveLbSettings(config) {
+    setLbConfig(config);
+    saveLeaderboardConfig(config);
+    setLbError(null);
+    if (isConfigured(config)) refreshLeaderboard(config);
+  }
+
+  const refreshLeaderboard = useCallback(async (config) => {
+    const cfg = config || lbConfig;
+    if (!isConfigured(cfg)) return;
+    setLbLoading(true);
+    setLbError(null);
+    try {
+      setLbEntries(await fetchScores(cfg));
+    } catch (e) {
+      setLbError(e && e.message ? e.message : "Could not load the leaderboard");
+    } finally {
+      setLbLoading(false);
+    }
+  }, [lbConfig]);
+
+  const publishMyScore = useCallback(async (config, who) => {
+    const cfg = config || lbConfig;
+    const target = who || activeAccount(accountsRef.current);
+    if (!isConfigured(cfg) || !target) return;
+    const stats = accountStats(target);
+    try {
+      await publishScore(cfg, entryForAccount(target, stats, levelForXp(stats.xp)));
+      setLbPublishedAt(Date.now());
+      setLbError(null);
+      refreshLeaderboard(cfg);
+    } catch (e) {
+      setLbError(e && e.message ? e.message : "Could not publish your score");
+    }
+  }, [lbConfig, refreshLeaderboard]);
 
   function openTree(mod) {
     setActiveModule(mod);
@@ -357,6 +434,7 @@ export default function SEBootcamp() {
     setStability(100);
     setRunXp(0);
     setCrashed(false);
+    setLeveledUp(null);
   }
 
   function beginRun(questions) {
@@ -447,7 +525,13 @@ export default function SEBootcamp() {
       runs: (progress.runs || 0) + 1,
       best,
     };
+    const before = levelForXp(progress.xp);
+    const after = levelForXp(next.xp);
+    setLeveledUp(after.number > before.number ? after : null);
     persist(next);
+    if (account && lbConfig.autoPublish && isConfigured(lbConfig)) {
+      publishMyScore(lbConfig, { ...account, progress: next });
+    }
     setScreen("result");
   }
 
@@ -463,13 +547,28 @@ export default function SEBootcamp() {
   }
 
   async function resetProgress() {
-    persist({ xp: 0, best: {}, runs: 0 });
+    persist(emptyProgress());
+  }
+
+  function openLeaderboard() {
+    setScreen("leaderboard");
+    if (isConfigured(lbConfig)) refreshLeaderboard();
   }
 
   if (!ready) {
     return (
       <div style={S.appShell}>
         <div style={{ ...S.mono, color: "#7d8590", fontSize: 13 }}>booting se//bootcamp …</div>
+      </div>
+    );
+  }
+
+  /* No profile yet (first visit, or every profile deleted) — ask for one before
+     any progress can be recorded against it. */
+  if (!account) {
+    return (
+      <div style={S.appShell}>
+        <OnboardingScreen onCreate={createAccount} />
       </div>
     );
   }
@@ -496,7 +595,11 @@ export default function SEBootcamp() {
       {screen === "home" && (
         <HomeScreen
           progress={progress}
+          account={account}
+          profileCount={accounts.accounts.length}
           onOpen={openTree}
+          onAccounts={() => setScreen("accounts")}
+          onLeaderboard={openLeaderboard}
           onReset={resetProgress}
           apiKey={apiKey}
           aiMode={aiMode}
@@ -506,6 +609,33 @@ export default function SEBootcamp() {
           syllabusText={syllabusText}
           onSaveSyllabus={saveSyllabus}
           onClearSyllabus={clearSyllabus}
+        />
+      )}
+      {screen === "accounts" && (
+        <AccountsScreen
+          accounts={accounts.accounts}
+          activeId={accounts.activeId}
+          onUse={switchToAccount}
+          onCreate={createAccount}
+          onRename={editAccountName}
+          onRecolour={editAccountColour}
+          onDelete={deleteAccount}
+          onHome={backHome}
+        />
+      )}
+      {screen === "leaderboard" && (
+        <LeaderboardScreen
+          accounts={accounts.accounts}
+          activeId={accounts.activeId}
+          config={lbConfig}
+          entries={lbEntries}
+          loading={lbLoading}
+          error={lbError}
+          publishedAt={lbPublishedAt}
+          onRefresh={() => refreshLeaderboard()}
+          onPublish={() => publishMyScore()}
+          onSaveConfig={saveLbSettings}
+          onHome={backHome}
         />
       )}
       {screen === "tree" && activeModule && (
@@ -545,6 +675,7 @@ export default function SEBootcamp() {
           runXp={runXp}
           bestStreak={bestStreak}
           crashed={crashed}
+          leveledUp={leveledUp}
           onRetry={() => startNode(activeModule, activeNode)}
           onTree={backToTree}
         />
@@ -557,7 +688,7 @@ export default function SEBootcamp() {
 /*  HOME — commit-graph module map                                     */
 /* ------------------------------------------------------------------ */
 
-function HomeScreen({ progress, onOpen, onReset, apiKey, aiMode, onSaveApiKey, onToggleAiMode, syllabusName, syllabusText, onSaveSyllabus, onClearSyllabus }) {
+function HomeScreen({ progress, account, profileCount, onOpen, onAccounts, onLeaderboard, onReset, apiKey, aiMode, onSaveApiKey, onToggleAiMode, syllabusName, syllabusText, onSaveSyllabus, onClearSyllabus }) {
   const lvl = levelForXp(progress.xp);
   const y11 = MODULES.filter((m) => m.year === 11);
   const y12 = MODULES.filter((m) => m.year === 12);
@@ -581,20 +712,35 @@ function HomeScreen({ progress, onOpen, onReset, apiKey, aiMode, onSaveApiKey, o
           </div>
         </div>
 
-        <div style={S.card}>
-          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <div style={{ width: 40, height: 40, borderRadius: 10, background: "rgba(86,212,221,0.12)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
-              <Trophy size={20} color="#56d4dd" />
+        <div style={{ ...S.card, minWidth: 262 }}>
+          <button
+            onClick={onAccounts}
+            title="switch profile"
+            style={{ display: "flex", alignItems: "center", gap: 10, width: "100%", background: "none", border: "none", padding: 0, cursor: "pointer", textAlign: "left" }}
+          >
+            <Avatar account={account} size={40} />
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ ...S.display, fontSize: 15, color: "#e6edf3", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {account ? account.name : "player"}
+              </div>
+              <div style={{ ...S.mono, fontSize: 10.5, color: "#7d8590" }}>
+                {profileCount > 1 ? `${profileCount} profiles · switch` : "switch profile"}
+              </div>
             </div>
-            <div>
-              <div style={{ ...S.mono, fontSize: 11, color: "#7d8590" }}>LEVEL {lvl.level + 1}</div>
-              <div style={{ ...S.display, fontSize: 15, color: "#e6edf3" }}>{lvl.title}</div>
-            </div>
+            <ChevronRight size={15} color="#3d4552" />
+          </button>
+
+          <div style={{ height: 1, background: "#1f2734", margin: "12px 0" }} />
+
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <Trophy size={15} color="#56d4dd" />
+            <div style={{ ...S.mono, fontSize: 11, color: "#7d8590" }}>LEVEL {lvl.number}/{MAX_LEVEL}</div>
           </div>
+          <div style={{ ...S.display, fontSize: 15, color: "#e6edf3", marginTop: 2 }}>{lvl.title}</div>
           <div style={{ marginTop: 10 }}>
             <div style={{ display: "flex", justifyContent: "space-between", ...S.mono, fontSize: 10.5, color: "#7d8590", marginBottom: 4 }}>
               <span>{progress.xp} XP</span>
-              <span>{lvl.pct}%</span>
+              <span>{lvl.isMax ? "max level" : `${lvl.toNext} to next`}</span>
             </div>
             <div style={{ height: 6, background: "#161d27", borderRadius: 4, overflow: "hidden" }}>
               <div style={{ height: "100%", width: `${lvl.pct}%`, background: "linear-gradient(90deg,#3fb950,#56d4dd)", borderRadius: 4, transition: "width .4s ease" }} />
@@ -620,6 +766,15 @@ function HomeScreen({ progress, onOpen, onReset, apiKey, aiMode, onSaveApiKey, o
         </div>
       </div>
 
+      <div style={{ display: "flex", justifyContent: "center", gap: 10, marginBottom: 18, flexWrap: "wrap" }}>
+        <button onClick={onLeaderboard} style={{ ...S.ghostBtn, color: "#f2cc60", borderColor: "#2d3542" }}>
+          <Medal size={13} /> leaderboard
+        </button>
+        <button onClick={onAccounts} style={{ ...S.ghostBtn, color: "#56d4dd", borderColor: "#2d3542" }}>
+          <Users size={13} /> profiles{profileCount > 1 ? ` (${profileCount})` : ""}
+        </button>
+      </div>
+
       <div style={{ display: "flex", justifyContent: "center", gap: 20 }}>
         <button
           onClick={onReset}
@@ -627,7 +782,7 @@ function HomeScreen({ progress, onOpen, onReset, apiKey, aiMode, onSaveApiKey, o
           onMouseEnter={(e) => (e.currentTarget.style.color = "#f85149")}
           onMouseLeave={(e) => (e.currentTarget.style.color = "#4b5563")}
         >
-          <RotateCcw size={12} /> reset progress
+          <RotateCcw size={12} /> reset this profile
         </button>
         <button
           onClick={() => setSettingsOpen((v) => !v)}
@@ -1119,7 +1274,7 @@ function QuizScreen({ mod, node, questions, order, qIndex, selected, locked, tim
 /*  RESULT                                                              */
 /* ------------------------------------------------------------------ */
 
-function ResultScreen({ mod, node, correctCount, total, runXp, bestStreak, crashed, onRetry, onTree }) {
+function ResultScreen({ mod, node, correctCount, total, runXp, bestStreak, crashed, leveledUp, onRetry, onTree }) {
   const pct = Math.round((correctCount / total) * 100);
   const stars = pct === 100 ? 3 : pct >= 70 ? 2 : pct >= 40 ? 1 : 0;
   const Icon = mod.icon;
@@ -1133,6 +1288,27 @@ function ResultScreen({ mod, node, correctCount, total, runXp, bestStreak, crash
 
   return (
     <div style={{ maxWidth: 520, margin: "0 auto", padding: "60px 20px" }}>
+      {leveledUp && (
+        <div
+          style={{
+            ...S.panel, padding: "14px 18px", marginBottom: 14, animation: "popIn .35s ease",
+            borderColor: "#f2cc6055", background: "rgba(242,204,96,0.07)",
+            display: "flex", alignItems: "center", gap: 12,
+          }}
+        >
+          <Trophy size={22} color="#f2cc60" />
+          <div>
+            <div style={{ ...S.display, fontSize: 15, color: "#f2cc60" }}>
+              level up — {leveledUp.title}
+            </div>
+            <div style={{ ...S.mono, fontSize: 11, color: "#7d8590", marginTop: 2 }}>
+              now level {leveledUp.number} of {MAX_LEVEL}
+              {leveledUp.isMax ? " · top rank reached" : ` · ${leveledUp.toNext} XP to the next`}
+            </div>
+          </div>
+        </div>
+      )}
+
       <div style={{ ...S.panel, padding: "32px 26px", textAlign: "center", animation: "popIn .3s ease" }}>
         <div style={{ width: 56, height: 56, borderRadius: 14, background: `${mod.accent}1a`, border: `1.5px solid ${mod.accent}55`, display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 16px" }}>
           <Icon size={26} color={mod.accent} />
@@ -1176,6 +1352,465 @@ function StatBox({ label, value, color = "#c9d1d9" }) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  PROFILES — local save slots, each with its own XP and progress      */
+/* ------------------------------------------------------------------ */
+
+function Avatar({ account, size = 36 }) {
+  const colour = (account && account.colour) || PROFILE_COLOURS[0];
+  return (
+    <div
+      style={{
+        width: size, height: size, borderRadius: size / 3.4, flexShrink: 0,
+        background: `${colour}1f`, border: `1px solid ${colour}66`,
+        display: "flex", alignItems: "center", justifyContent: "center",
+        ...S.mono, fontSize: size * 0.36, fontWeight: 700, color: colour,
+      }}
+    >
+      {initials(account ? account.name : "")}
+    </div>
+  );
+}
+
+function ColourPicker({ value, onPick }) {
+  return (
+    <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>
+      {PROFILE_COLOURS.map((c) => (
+        <button
+          key={c}
+          onClick={() => onPick(c)}
+          aria-label={`colour ${c}`}
+          style={{
+            width: 24, height: 24, borderRadius: 7, cursor: "pointer",
+            background: `${c}2b`, border: `2px solid ${value === c ? c : "transparent"}`,
+            display: "flex", alignItems: "center", justifyContent: "center",
+          }}
+        >
+          <span style={{ width: 9, height: 9, borderRadius: 3, background: c, display: "block" }} />
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function OnboardingScreen({ onCreate }) {
+  const [name, setName] = useState("");
+  const [colour, setColour] = useState(PROFILE_COLOURS[0]);
+  const ready = cleanName(name).length > 0;
+
+  return (
+    <div style={{ maxWidth: 420, margin: "0 auto", padding: "80px 20px 60px" }}>
+      <div style={{ ...S.mono, fontSize: 12, color: "#56d4dd", letterSpacing: 1.5, marginBottom: 6 }}>
+        ~/nesa/software-engineering-11-12
+      </div>
+      <h1 style={{ ...S.display, fontSize: 30, margin: "0 0 8px", color: "#e6edf3", display: "flex", alignItems: "center", gap: 10 }}>
+        <GitBranch size={26} color="#56d4dd" strokeWidth={2.2} />
+        se<span style={{ color: "#3fb950" }}>//</span>bootcamp
+      </h1>
+      <div style={{ ...S.mono, fontSize: 12.5, color: "#7d8590", marginBottom: 22 }}>
+        Create a profile to track your XP, levels and cleared nodes.
+      </div>
+
+      <div style={{ ...S.panel, padding: "20px 20px 22px" }}>
+        <div style={{ ...S.mono, fontSize: 11, color: "#7d8590", marginBottom: 8 }}>DISPLAY NAME</div>
+        <input
+          value={name}
+          autoFocus
+          maxLength={MAX_NAME_LENGTH}
+          onChange={(e) => setName(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter" && ready) onCreate(name, colour); }}
+          placeholder="e.g. ada"
+          style={S.input}
+        />
+        <div style={{ ...S.mono, fontSize: 10.5, color: "#4b5563", margin: "8px 0 18px" }}>
+          Shown on the leaderboard · up to {MAX_NAME_LENGTH} characters
+        </div>
+
+        <div style={{ ...S.mono, fontSize: 11, color: "#7d8590", marginBottom: 8 }}>COLOUR</div>
+        <ColourPicker value={colour} onPick={setColour} />
+
+        <button
+          disabled={!ready}
+          onClick={() => onCreate(name, colour)}
+          style={{ ...S.primaryBtn("#3fb950"), width: "100%", marginTop: 20, opacity: ready ? 1 : 0.4, cursor: ready ? "pointer" : "not-allowed" }}
+        >
+          <UserPlus size={15} /> create profile
+        </button>
+        <div style={{ ...S.mono, fontSize: 10.5, color: "#4b5563", marginTop: 12, lineHeight: 1.5 }}>
+          Profiles are saved in this browser only — no password, no sign-in, and clearing site data removes them.
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AccountsScreen({ accounts, activeId, onUse, onCreate, onRename, onRecolour, onDelete, onHome }) {
+  const [adding, setAdding] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [newColour, setNewColour] = useState(PROFILE_COLOURS[1]);
+  const [editingId, setEditingId] = useState(null);
+  const [editName, setEditName] = useState("");
+  const [confirmId, setConfirmId] = useState(null);
+
+  const ranked = [...accounts].sort((a, b) => (b.progress.xp || 0) - (a.progress.xp || 0));
+
+  return (
+    <div style={{ maxWidth: 680, margin: "0 auto", padding: "24px 18px 60px" }}>
+      <button onClick={onHome} style={{ ...S.ghostBtn, marginBottom: 20 }}>
+        <ArrowLeft size={13} /> back
+      </button>
+
+      <h2 style={{ ...S.display, fontSize: 22, color: "#e6edf3", margin: "0 0 4px", display: "flex", alignItems: "center", gap: 9 }}>
+        <Users size={20} color="#56d4dd" /> profiles
+      </h2>
+      <div style={{ ...S.mono, fontSize: 11.5, color: "#7d8590", marginBottom: 22 }}>
+        Save slots stored in this browser. Each keeps its own XP, level and cleared nodes.
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        {ranked.map((acc) => {
+          const stats = accountStats(acc);
+          const lvl = levelForXp(stats.xp);
+          const isActive = acc.id === activeId;
+          const isEditing = editingId === acc.id;
+
+          return (
+            <div
+              key={acc.id}
+              style={{
+                ...S.panel,
+                padding: "13px 15px",
+                borderColor: isActive ? `${acc.colour}66` : "#1f2734",
+                background: isActive ? `${acc.colour}0d` : "#11161d",
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                <Avatar account={acc} size={42} />
+
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  {isEditing ? (
+                    <input
+                      value={editName}
+                      autoFocus
+                      maxLength={MAX_NAME_LENGTH}
+                      onChange={(e) => setEditName(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") { onRename(acc.id, editName); setEditingId(null); }
+                        if (e.key === "Escape") setEditingId(null);
+                      }}
+                      onBlur={() => { onRename(acc.id, editName); setEditingId(null); }}
+                      style={{ ...S.input, padding: "6px 9px", fontSize: 13 }}
+                    />
+                  ) : (
+                    <div style={{ ...S.display, fontSize: 15, color: "#e6edf3", display: "flex", alignItems: "center", gap: 8 }}>
+                      {acc.name}
+                      {isActive && (
+                        <span style={{ ...S.mono, fontSize: 9.5, color: acc.colour, border: `1px solid ${acc.colour}55`, borderRadius: 5, padding: "1px 5px" }}>
+                          playing
+                        </span>
+                      )}
+                    </div>
+                  )}
+                  <div style={{ ...S.mono, fontSize: 10.5, color: "#7d8590", marginTop: 3 }}>
+                    lvl {lvl.number} {lvl.title} · {stats.xp} XP · {stats.cleared} cleared
+                  </div>
+                </div>
+
+                <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                  {!isActive && (
+                    <button onClick={() => onUse(acc.id)} style={{ ...S.ghostBtn, padding: "6px 10px" }}>
+                      play
+                    </button>
+                  )}
+                  <button
+                    onClick={() => { setEditingId(acc.id); setEditName(acc.name); }}
+                    title="rename"
+                    style={{ ...S.ghostBtn, padding: "6px 8px" }}
+                  >
+                    <Pencil size={12} />
+                  </button>
+                  <button
+                    onClick={() => setConfirmId(confirmId === acc.id ? null : acc.id)}
+                    title="delete"
+                    style={{ ...S.ghostBtn, padding: "6px 8px", color: confirmId === acc.id ? "#f85149" : "#7d8590" }}
+                  >
+                    <Trash2 size={12} />
+                  </button>
+                </div>
+              </div>
+
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 11 }}>
+                <span style={{ ...S.mono, fontSize: 10, color: "#4b5563" }}>colour</span>
+                <ColourPicker value={acc.colour} onPick={(c) => onRecolour(acc.id, c)} />
+              </div>
+
+              {confirmId === acc.id && (
+                <div style={{ marginTop: 12, padding: "10px 12px", background: "rgba(248,81,73,0.07)", border: "1px solid rgba(248,81,73,0.3)", borderRadius: 9 }}>
+                  <div style={{ ...S.mono, fontSize: 11, color: "#f85149", marginBottom: 9 }}>
+                    Delete {acc.name} and all {stats.xp} XP of progress? This cannot be undone.
+                  </div>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button
+                      onClick={() => { onDelete(acc.id); setConfirmId(null); }}
+                      style={{ ...S.ghostBtn, color: "#f85149", borderColor: "rgba(248,81,73,0.4)" }}
+                    >
+                      delete permanently
+                    </button>
+                    <button onClick={() => setConfirmId(null)} style={S.ghostBtn}>cancel</button>
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {adding ? (
+        <div style={{ ...S.panel, padding: "16px 16px 18px", marginTop: 14 }}>
+          <div style={{ ...S.mono, fontSize: 11, color: "#7d8590", marginBottom: 8 }}>NEW PROFILE</div>
+          <input
+            value={newName}
+            autoFocus
+            maxLength={MAX_NAME_LENGTH}
+            placeholder="display name"
+            onChange={(e) => setNewName(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter" && cleanName(newName)) { onCreate(newName, newColour); setAdding(false); setNewName(""); } }}
+            style={S.input}
+          />
+          <div style={{ marginTop: 12 }}>
+            <ColourPicker value={newColour} onPick={setNewColour} />
+          </div>
+          <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
+            <button
+              disabled={!cleanName(newName)}
+              onClick={() => { onCreate(newName, newColour); setAdding(false); setNewName(""); }}
+              style={{ ...S.primaryBtn("#3fb950"), flex: 1, opacity: cleanName(newName) ? 1 : 0.4 }}
+            >
+              <Check size={14} /> create
+            </button>
+            <button onClick={() => setAdding(false)} style={{ ...S.ghostBtn, justifyContent: "center", flex: 1 }}>cancel</button>
+          </div>
+        </div>
+      ) : (
+        <button onClick={() => setAdding(true)} style={{ ...S.ghostBtn, marginTop: 14, width: "100%", justifyContent: "center", padding: "11px 12px" }}>
+          <UserPlus size={13} /> new profile
+        </button>
+      )}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/*  LEADERBOARD — this device, plus an optional shared board           */
+/* ------------------------------------------------------------------ */
+
+function LeaderboardScreen({ accounts, activeId, config, entries, loading, error, publishedAt, onRefresh, onPublish, onSaveConfig, onHome }) {
+  const configured = isConfigured(config);
+  const [tab, setTab] = useState(configured ? "global" : "device");
+  const [settingsOpen, setSettingsOpen] = useState(false);
+
+  const deviceRows = rankEntries(
+    accounts.map((acc) => {
+      const stats = accountStats(acc);
+      const lvl = levelForXp(stats.xp);
+      return {
+        player_id: acc.id, name: acc.name, colour: acc.colour,
+        xp: stats.xp, level: lvl.number, title: lvl.title,
+        cleared: stats.cleared, stars: stats.stars, accuracy: stats.accuracy, runs: stats.runs,
+      };
+    })
+  );
+  const globalRows = rankEntries(entries || []);
+  const rows = tab === "device" ? deviceRows : globalRows;
+
+  return (
+    <div style={{ maxWidth: 720, margin: "0 auto", padding: "24px 18px 60px" }}>
+      <button onClick={onHome} style={{ ...S.ghostBtn, marginBottom: 20 }}>
+        <ArrowLeft size={13} /> back
+      </button>
+
+      <h2 style={{ ...S.display, fontSize: 22, color: "#e6edf3", margin: "0 0 4px", display: "flex", alignItems: "center", gap: 9 }}>
+        <Medal size={20} color="#f2cc60" /> leaderboard
+      </h2>
+      <div style={{ ...S.mono, fontSize: 11.5, color: "#7d8590", marginBottom: 18 }}>
+        Ranked by XP, then nodes cleared, then accuracy.
+      </div>
+
+      <div style={{ display: "flex", gap: 8, marginBottom: 16, flexWrap: "wrap" }}>
+        <button
+          onClick={() => setTab("device")}
+          style={{ ...S.ghostBtn, color: tab === "device" ? "#56d4dd" : "#7d8590", borderColor: tab === "device" ? "#56d4dd55" : "#232b36" }}
+        >
+          <Users size={13} /> this device
+        </button>
+        <button
+          onClick={() => { setTab("global"); if (configured) onRefresh(); }}
+          style={{ ...S.ghostBtn, color: tab === "global" ? "#f2cc60" : "#7d8590", borderColor: tab === "global" ? "#f2cc6055" : "#232b36" }}
+        >
+          <Globe size={13} /> global
+        </button>
+        <div style={{ flex: 1 }} />
+        {tab === "global" && configured && (
+          <>
+            <button onClick={onRefresh} style={S.ghostBtn} title="refresh">
+              <RefreshCw size={13} className={loading ? "spin" : ""} /> refresh
+            </button>
+            <button onClick={onPublish} style={{ ...S.ghostBtn, color: "#3fb950", borderColor: "#3fb95044" }}>
+              <Upload size={13} /> publish my score
+            </button>
+          </>
+        )}
+        <button
+          onClick={() => setSettingsOpen((v) => !v)}
+          style={{ ...S.ghostBtn, color: settingsOpen ? "#f2cc60" : "#7d8590" }}
+        >
+          <Settings size={13} /> setup
+        </button>
+      </div>
+
+      {settingsOpen && (
+        <LeaderboardSettings config={config} onSave={onSaveConfig} onClose={() => setSettingsOpen(false)} />
+      )}
+
+      {tab === "global" && !configured && (
+        <div style={{ ...S.panel, padding: "18px 18px 20px", marginBottom: 14 }}>
+          <div style={{ ...S.display, fontSize: 14, color: "#e6edf3", marginBottom: 8 }}>No shared board connected</div>
+          <div style={{ ...S.mono, fontSize: 11.5, color: "#7d8590", lineHeight: 1.6 }}>
+            This app is served as static files, so scores can only be shared through a database you
+            control. Open <span style={{ color: "#f2cc60" }}>setup</span> and paste a Supabase project
+            URL and anon key — the SQL to create the table is in{" "}
+            <span style={{ color: "#56d4dd" }}>lib/leaderboard.js</span>. Until then, the device board
+            below works offline.
+          </div>
+        </div>
+      )}
+
+      {tab === "global" && error && (
+        <div style={{ ...S.mono, fontSize: 11.5, color: "#f85149", background: "rgba(248,81,73,0.08)", border: "1px solid rgba(248,81,73,0.3)", borderRadius: 9, padding: "10px 12px", marginBottom: 14 }}>
+          {error}
+        </div>
+      )}
+
+      {tab === "global" && configured && publishedAt && !error && (
+        <div style={{ ...S.mono, fontSize: 11, color: "#3fb950", marginBottom: 12 }}>
+          score published {new Date(publishedAt).toLocaleTimeString()}
+        </div>
+      )}
+
+      {tab === "global" && configured && loading && !rows.length ? (
+        <div style={{ ...S.mono, fontSize: 12, color: "#7d8590", padding: "20px 2px" }}>loading scores …</div>
+      ) : rows.length === 0 ? (
+        <div style={{ ...S.mono, fontSize: 12, color: "#4b5563", padding: "20px 2px" }}>
+          {tab === "global" ? "No scores posted yet — be the first." : "No profiles yet."}
+        </div>
+      ) : (
+        <div style={{ ...S.panel, overflow: "hidden" }}>
+          {rows.map((row, i) => {
+            const mine = row.player_id === activeId;
+            const medal = ["#f2cc60", "#c9d1d9", "#d08a4a"][i];
+            return (
+              <div
+                key={row.player_id || `${row.name}-${i}`}
+                style={{
+                  display: "flex", alignItems: "center", gap: 12, padding: "12px 15px",
+                  borderBottom: i === rows.length - 1 ? "none" : "1px solid #1a2029",
+                  background: mine ? "rgba(86,212,221,0.06)" : "transparent",
+                }}
+              >
+                <div style={{ width: 26, textAlign: "center", flexShrink: 0 }}>
+                  {i < 3 ? (
+                    <Crown size={15} color={medal} />
+                  ) : (
+                    <span style={{ ...S.mono, fontSize: 12, color: "#4b5563" }}>{i + 1}</span>
+                  )}
+                </div>
+                <Avatar account={{ name: row.name, colour: row.colour || "#56d4dd" }} size={32} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ ...S.display, fontSize: 14, color: "#e6edf3", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {row.name}{mine ? " · you" : ""}
+                  </div>
+                  <div style={{ ...S.mono, fontSize: 10.5, color: "#7d8590", marginTop: 2 }}>
+                    lvl {row.level} {row.title} · {row.cleared} cleared · {row.accuracy}% accurate
+                  </div>
+                </div>
+                <div style={{ ...S.mono, fontSize: 13, color: "#56d4dd", flexShrink: 0 }}>{row.xp} XP</div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function LeaderboardSettings({ config, onSave, onClose }) {
+  const [url, setUrl] = useState(config.url || "");
+  const [key, setKey] = useState(config.key || "");
+  const [table, setTable] = useState(config.table || DEFAULT_CONFIG.table);
+  const [autoPublish, setAutoPublish] = useState(config.autoPublish !== false);
+  const [showKey, setShowKey] = useState(false);
+
+  return (
+    <div style={{ ...S.panel, padding: "18px 18px 20px", marginBottom: 16 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+        <div style={{ ...S.display, fontSize: 14, color: "#e6edf3" }}>Shared leaderboard</div>
+        <button onClick={onClose} style={{ ...S.ghostBtn, padding: "4px 7px" }}><X size={12} /></button>
+      </div>
+
+      <div style={{ ...S.mono, fontSize: 11, color: "#7d8590", lineHeight: 1.6, marginBottom: 14 }}>
+        Point the app at a Supabase table to share scores between devices. Both values stay in this
+        browser and are sent only to that project. Anyone using the page can post a score, so treat
+        the board as friendly rather than authoritative.
+      </div>
+
+      <div style={{ ...S.mono, fontSize: 10.5, color: "#7d8590", marginBottom: 6 }}>PROJECT URL</div>
+      <input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://xxxx.supabase.co" style={S.input} />
+
+      <div style={{ ...S.mono, fontSize: 10.5, color: "#7d8590", margin: "12px 0 6px" }}>ANON KEY</div>
+      <div style={{ position: "relative" }}>
+        <input
+          value={key}
+          onChange={(e) => setKey(e.target.value)}
+          type={showKey ? "text" : "password"}
+          placeholder="public anon key"
+          style={{ ...S.input, paddingRight: 38 }}
+        />
+        <button
+          onClick={() => setShowKey((v) => !v)}
+          style={{ position: "absolute", right: 8, top: 8, background: "none", border: "none", cursor: "pointer", color: "#7d8590" }}
+        >
+          {showKey ? <EyeOff size={14} /> : <Eye size={14} />}
+        </button>
+      </div>
+
+      <div style={{ ...S.mono, fontSize: 10.5, color: "#7d8590", margin: "12px 0 6px" }}>TABLE</div>
+      <input value={table} onChange={(e) => setTable(e.target.value)} placeholder="leaderboard" style={S.input} />
+
+      <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 14, cursor: "pointer", ...S.mono, fontSize: 11.5, color: "#c9d1d9" }}>
+        <input type="checkbox" checked={autoPublish} onChange={(e) => setAutoPublish(e.target.checked)} />
+        publish my score automatically after each run
+      </label>
+
+      <div style={{ display: "flex", gap: 8, marginTop: 16 }}>
+        <button
+          onClick={() => { onSave({ url: url.trim(), key: key.trim(), table: table.trim() || DEFAULT_CONFIG.table, autoPublish }); onClose(); }}
+          style={{ ...S.primaryBtn("#f2cc60"), flex: 1 }}
+        >
+          <Check size={14} /> save
+        </button>
+        {(config.url || config.key) && (
+          <button
+            onClick={() => { onSave({ ...DEFAULT_CONFIG, autoPublish }); setUrl(""); setKey(""); onClose(); }}
+            style={{ ...S.ghostBtn, justifyContent: "center", flex: 1 }}
+          >
+            disconnect
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /*  STYLE TOKENS                                                        */
 /* ------------------------------------------------------------------ */
 
@@ -1191,6 +1826,12 @@ const S = {
   mono: { fontFamily: "ui-monospace, 'SF Mono', 'Cascadia Code', 'JetBrains Mono', Menlo, monospace" },
   display: { fontFamily: "ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif", fontWeight: 700, letterSpacing: -0.3 },
   panel: { background: "#11161d", border: "1px solid #1f2734", borderRadius: 14 },
+  input: {
+    width: "100%", boxSizing: "border-box",
+    fontFamily: "ui-monospace, 'SF Mono', Menlo, monospace", fontSize: 12.5, color: "#e6edf3",
+    background: "#0d1219", border: "1px solid #232b36", borderRadius: 8, padding: "9px 10px",
+    outline: "none",
+  },
   card: { background: "#11161d", border: "1px solid #1f2734", borderRadius: 14, padding: "14px 16px", minWidth: 220 },
   ghostBtn: {
     fontFamily: "ui-monospace, monospace", fontSize: 12, color: "#7d8590",
