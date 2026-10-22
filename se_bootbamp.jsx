@@ -11,10 +11,13 @@ import {
   loadAccountState, saveAccountState, activeAccount, addAccount, switchAccount,
   renameAccount, recolourAccount, removeAccount, setProgress, accountStats,
   emptyProgress, initials, cleanName, PROFILE_COLOURS, MAX_NAME_LENGTH,
+  hasPassword, setAccountAuth, hashPassword, verifyPassword, passwordProblem,
+  cryptoAvailable, MIN_PASSWORD_LENGTH,
 } from "./lib/accounts.js";
 import {
-  loadLeaderboardConfig, saveLeaderboardConfig, isConfigured, fetchScores,
-  publishScore, entryForAccount, rankEntries, DEFAULT_CONFIG,
+  loadLeaderboardConfig, saveLeaderboardConfig, isConfigured, fileEnabled,
+  fetchScores, fetchFileScores, publishScore, entryForAccount, rankEntries,
+  mergeEntries, downloadFile, DEFAULT_CONFIG,
 } from "./lib/leaderboard.js";
 import { programmingFundamentalsNodes } from "./questions/programming-fundamentals.js";
 import { objectOrientedParadigmNodes } from "./questions/object-oriented-paradigm.js";
@@ -229,6 +232,28 @@ async function generateAiQuestions(apiKey, mod, node, count, syllabusText) {
   return qs;
 }
 
+/* Unlocked profiles are remembered for the tab, not saved — closing the tab
+   or reopening the site asks for the password again. */
+const UNLOCK_SESSION_KEY = "se-bootcamp-unlocked";
+
+function loadUnlocked() {
+  try {
+    const raw = sessionStorage.getItem(UNLOCK_SESSION_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function rememberUnlocked(ids) {
+  try {
+    sessionStorage.setItem(UNLOCK_SESSION_KEY, JSON.stringify(ids));
+  } catch (e) {
+    /* unlock state stays in memory for this session */
+  }
+}
+
 function nodeKey(moduleId, nodeId) {
   return `${moduleId}::${nodeId}`;
 }
@@ -244,6 +269,11 @@ export default function SEBootcamp() {
   const [activeModule, setActiveModule] = useState(null);
   const [activeNode, setActiveNode] = useState(null);
   const [leveledUp, setLeveledUp] = useState(null);
+
+  // which profiles have been unlocked this browsing session
+  const [unlocked, setUnlocked] = useState(loadUnlocked);
+  const [unlockError, setUnlockError] = useState(null);
+  const [unlockBusy, setUnlockBusy] = useState(false);
 
   // leaderboard
   const [lbConfig, setLbConfig] = useState(DEFAULT_CONFIG);
@@ -358,16 +388,63 @@ export default function SEBootcamp() {
     persistAccounts(setProgress(state, state.activeId, nextProgress));
   }, [persistAccounts]);
 
-  function createAccount(name, colour) {
-    persistAccounts(addAccount(accountsRef.current, name, colour));
+  function markUnlocked(id) {
+    setUnlocked((prev) => {
+      if (prev.includes(id)) return prev;
+      const next = [...prev, id];
+      rememberUnlocked(next);
+      return next;
+    });
+  }
+
+  async function createAccount(name, colour, password) {
+    const auth = password ? await hashPassword(password) : null;
+    const next = addAccount(accountsRef.current, name, colour, auth);
+    persistAccounts(next);
+    markUnlocked(next.activeId);
     setScreen("home");
   }
 
+  /* Switching only changes who is active; a profile with a password then meets
+     the lock screen before any of its progress is shown. */
   function switchToAccount(id) {
     persistAccounts(switchAccount(accountsRef.current, id));
     setActiveModule(null);
     setActiveNode(null);
+    setUnlockError(null);
     setScreen("home");
+  }
+
+  async function unlockAccount(id, password) {
+    const target = accountsRef.current.accounts.find((a) => a.id === id);
+    if (!target) return;
+    setUnlockBusy(true);
+    setUnlockError(null);
+    try {
+      if (await verifyPassword(password, target.auth)) {
+        markUnlocked(id);
+        if (accountsRef.current.activeId !== id) switchToAccount(id);
+      } else {
+        setUnlockError("That password does not match");
+      }
+    } catch (e) {
+      setUnlockError(e && e.message ? e.message : "Could not check that password");
+    } finally {
+      setUnlockBusy(false);
+    }
+  }
+
+  /** Setting, changing or clearing a password; `current` is checked when one exists. */
+  async function changeAccountPassword(id, current, next) {
+    const target = accountsRef.current.accounts.find((a) => a.id === id);
+    if (!target) return "Profile not found";
+    if (hasPassword(target) && !(await verifyPassword(current, target.auth))) {
+      return "Current password does not match";
+    }
+    const auth = next ? await hashPassword(next) : null;
+    persistAccounts(setAccountAuth(accountsRef.current, id, auth));
+    markUnlocked(id);
+    return null;
   }
 
   function editAccountName(id, name) {
@@ -386,18 +463,32 @@ export default function SEBootcamp() {
     setLbConfig(config);
     saveLeaderboardConfig(config);
     setLbError(null);
-    if (isConfigured(config)) refreshLeaderboard(config);
+    refreshLeaderboard(config);
   }
 
+  /* Reads whichever sources are switched on — the JSON file that ships with the
+     site, the Supabase table, or both — and merges them into one board. */
   const refreshLeaderboard = useCallback(async (config) => {
     const cfg = config || lbConfig;
-    if (!isConfigured(cfg)) return;
+    const sources = [];
+    if (fileEnabled(cfg)) sources.push(["file", fetchFileScores(cfg)]);
+    if (isConfigured(cfg)) sources.push(["shared table", fetchScores(cfg)]);
+    if (!sources.length) {
+      setLbEntries([]);
+      return;
+    }
     setLbLoading(true);
     setLbError(null);
     try {
-      setLbEntries(await fetchScores(cfg));
-    } catch (e) {
-      setLbError(e && e.message ? e.message : "Could not load the leaderboard");
+      const settled = await Promise.allSettled(sources.map(([, p]) => p));
+      const lists = [];
+      const failures = [];
+      settled.forEach((result, i) => {
+        if (result.status === "fulfilled") lists.push(result.value);
+        else failures.push(`${sources[i][0]}: ${result.reason && result.reason.message ? result.reason.message : result.reason}`);
+      });
+      setLbEntries(mergeEntries(...lists));
+      setLbError(failures.length ? failures.join(" · ") : null);
     } finally {
       setLbLoading(false);
     }
@@ -552,7 +643,14 @@ export default function SEBootcamp() {
 
   function openLeaderboard() {
     setScreen("leaderboard");
-    if (isConfigured(lbConfig)) refreshLeaderboard();
+    refreshLeaderboard();
+  }
+
+  function exportLeaderboard() {
+    const mine = account
+      ? [entryForAccount(account, accountStats(account), levelForXp(accountStats(account).xp))]
+      : [];
+    downloadFile(mergeEntries(lbEntries, mine), (lbConfig.filePath || "leaderboard.json").split("/").pop());
   }
 
   if (!ready) {
@@ -569,6 +667,24 @@ export default function SEBootcamp() {
     return (
       <div style={S.appShell}>
         <OnboardingScreen onCreate={createAccount} />
+      </div>
+    );
+  }
+
+  /* The active profile is password-protected and has not been unlocked in this
+     tab, so nothing of its progress is rendered until it is. */
+  if (hasPassword(account) && !unlocked.includes(account.id)) {
+    return (
+      <div style={S.appShell}>
+        <LockScreen
+          account={account}
+          others={accounts.accounts.filter((a) => a.id !== account.id)}
+          error={unlockError}
+          busy={unlockBusy}
+          onUnlock={(password) => unlockAccount(account.id, password)}
+          onPick={switchToAccount}
+          onForget={() => { deleteAccount(account.id); setUnlockError(null); }}
+        />
       </div>
     );
   }
@@ -620,6 +736,7 @@ export default function SEBootcamp() {
           onRename={editAccountName}
           onRecolour={editAccountColour}
           onDelete={deleteAccount}
+          onChangePassword={changeAccountPassword}
           onHome={backHome}
         />
       )}
@@ -634,6 +751,7 @@ export default function SEBootcamp() {
           publishedAt={lbPublishedAt}
           onRefresh={() => refreshLeaderboard()}
           onPublish={() => publishMyScore()}
+          onExport={exportLeaderboard}
           onSaveConfig={saveLbSettings}
           onHome={backHome}
         />
@@ -1395,7 +1513,26 @@ function ColourPicker({ value, onPick }) {
 function OnboardingScreen({ onCreate }) {
   const [name, setName] = useState("");
   const [colour, setColour] = useState(PROFILE_COLOURS[0]);
-  const ready = cleanName(name).length > 0;
+  const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+
+  const secure = cryptoAvailable();
+  const pwProblem = secure ? passwordProblem(password, confirm) : null;
+  const ready = cleanName(name).length > 0 && !pwProblem && !busy;
+
+  async function submit() {
+    if (!ready) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await onCreate(name, colour, secure ? password : "");
+    } catch (e) {
+      setError(e && e.message ? e.message : "Could not create that profile");
+      setBusy(false);
+    }
+  }
 
   return (
     <div style={{ maxWidth: 420, margin: "0 auto", padding: "80px 20px 60px" }}>
@@ -1417,7 +1554,7 @@ function OnboardingScreen({ onCreate }) {
           autoFocus
           maxLength={MAX_NAME_LENGTH}
           onChange={(e) => setName(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter" && ready) onCreate(name, colour); }}
+          onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
           placeholder="e.g. ada"
           style={S.input}
         />
@@ -1425,31 +1562,224 @@ function OnboardingScreen({ onCreate }) {
           Shown on the leaderboard · up to {MAX_NAME_LENGTH} characters
         </div>
 
+        {secure && (
+          <>
+            <div style={{ ...S.mono, fontSize: 11, color: "#7d8590", marginBottom: 8 }}>PASSWORD</div>
+            <input
+              value={password}
+              type="password"
+              onChange={(e) => setPassword(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
+              placeholder={`at least ${MIN_PASSWORD_LENGTH} characters`}
+              style={S.input}
+            />
+            <input
+              value={confirm}
+              type="password"
+              onChange={(e) => setConfirm(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
+              placeholder="confirm password"
+              style={{ ...S.input, marginTop: 8 }}
+            />
+            <div style={{ ...S.mono, fontSize: 10.5, color: password || confirm ? (pwProblem ? "#f85149" : "#3fb950") : "#4b5563", margin: "8px 0 18px" }}>
+              {password || confirm ? (pwProblem || "passwords match") : "needed to open this profile later"}
+            </div>
+          </>
+        )}
+
         <div style={{ ...S.mono, fontSize: 11, color: "#7d8590", marginBottom: 8 }}>COLOUR</div>
         <ColourPicker value={colour} onPick={setColour} />
 
+        {error && (
+          <div style={{ ...S.mono, fontSize: 11, color: "#f85149", marginTop: 14 }}>{error}</div>
+        )}
+
         <button
           disabled={!ready}
-          onClick={() => onCreate(name, colour)}
+          onClick={submit}
           style={{ ...S.primaryBtn("#3fb950"), width: "100%", marginTop: 20, opacity: ready ? 1 : 0.4, cursor: ready ? "pointer" : "not-allowed" }}
         >
-          <UserPlus size={15} /> create profile
+          {busy ? <Loader2 size={15} className="spin" /> : <UserPlus size={15} />}
+          {busy ? "creating …" : "create profile"}
         </button>
         <div style={{ ...S.mono, fontSize: 10.5, color: "#4b5563", marginTop: 12, lineHeight: 1.5 }}>
-          Profiles are saved in this browser only — no password, no sign-in, and clearing site data removes them.
+          {secure
+            ? "Saved in this browser only. The password keeps other people here out of your profile, but it is not encryption and there is no way to recover it."
+            : "Passwords need a secure page (https or localhost), so this profile will open without one."}
         </div>
       </div>
     </div>
   );
 }
 
-function AccountsScreen({ accounts, activeId, onUse, onCreate, onRename, onRecolour, onDelete, onHome }) {
+function LockScreen({ account, others, error, busy, onUnlock, onPick, onForget }) {
+  const [password, setPassword] = useState("");
+  const [showOthers, setShowOthers] = useState(false);
+  const [confirmForget, setConfirmForget] = useState(false);
+
+  useEffect(() => { setPassword(""); }, [account.id]);
+
+  return (
+    <div style={{ maxWidth: 400, margin: "0 auto", padding: "80px 20px 60px" }}>
+      <div style={{ ...S.mono, fontSize: 12, color: "#56d4dd", letterSpacing: 1.5, marginBottom: 20 }}>
+        ~/nesa/software-engineering-11-12
+      </div>
+
+      <div style={{ ...S.panel, padding: "24px 22px" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20 }}>
+          <Avatar account={account} size={46} />
+          <div>
+            <div style={{ ...S.display, fontSize: 17, color: "#e6edf3" }}>{account.name}</div>
+            <div style={{ ...S.mono, fontSize: 11, color: "#7d8590", display: "flex", alignItems: "center", gap: 5, marginTop: 2 }}>
+              <Lock size={11} /> locked
+            </div>
+          </div>
+        </div>
+
+        <input
+          value={password}
+          type="password"
+          autoFocus
+          onChange={(e) => setPassword(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter" && password && !busy) onUnlock(password); }}
+          placeholder="password"
+          style={S.input}
+        />
+
+        {error && (
+          <div style={{ ...S.mono, fontSize: 11, color: "#f85149", marginTop: 10 }}>{error}</div>
+        )}
+
+        <button
+          disabled={!password || busy}
+          onClick={() => onUnlock(password)}
+          style={{ ...S.primaryBtn(account.colour), width: "100%", marginTop: 16, opacity: password && !busy ? 1 : 0.4 }}
+        >
+          {busy ? <Loader2 size={15} className="spin" /> : <Check size={15} />}
+          {busy ? "checking …" : "unlock"}
+        </button>
+
+        <div style={{ display: "flex", gap: 10, marginTop: 14, justifyContent: "space-between" }}>
+          {others.length > 0 && (
+            <button
+              onClick={() => setShowOthers((v) => !v)}
+              style={{ ...S.mono, fontSize: 11, color: "#7d8590", background: "none", border: "none", cursor: "pointer", padding: 0 }}
+            >
+              use another profile
+            </button>
+          )}
+          <button
+            onClick={() => setConfirmForget((v) => !v)}
+            style={{ ...S.mono, fontSize: 11, color: "#4b5563", background: "none", border: "none", cursor: "pointer", padding: 0 }}
+          >
+            forgot password?
+          </button>
+        </div>
+
+        {showOthers && (
+          <div style={{ marginTop: 14, borderTop: "1px solid #1f2734", paddingTop: 14, display: "flex", flexDirection: "column", gap: 8 }}>
+            {others.map((other) => (
+              <button
+                key={other.id}
+                onClick={() => onPick(other.id)}
+                style={{ ...S.ghostBtn, justifyContent: "flex-start", gap: 10, padding: "8px 10px" }}
+              >
+                <Avatar account={other} size={24} />
+                <span style={{ color: "#c9d1d9" }}>{other.name}</span>
+                {hasPassword(other) && <Lock size={11} color="#4b5563" />}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {confirmForget && (
+          <div style={{ marginTop: 14, padding: "11px 12px", background: "rgba(248,81,73,0.07)", border: "1px solid rgba(248,81,73,0.3)", borderRadius: 9 }}>
+            <div style={{ ...S.mono, fontSize: 11, color: "#f85149", lineHeight: 1.5, marginBottom: 10 }}>
+              Nothing here can recover the password — no email, no reset. The only way past it is to
+              delete this profile and start again, which loses its XP and cleared nodes.
+            </div>
+            <button onClick={onForget} style={{ ...S.ghostBtn, color: "#f85149", borderColor: "rgba(248,81,73,0.4)" }}>
+              <Trash2 size={12} /> delete {account.name}
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function PasswordPanel({ account, onChangePassword, onClose }) {
+  const [current, setCurrent] = useState("");
+  const [next, setNext] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const existing = hasPassword(account);
+
+  async function apply(clearing) {
+    setBusy(true);
+    setError(null);
+    const problem = clearing ? null : passwordProblem(next, confirm);
+    if (problem) { setError(problem); setBusy(false); return; }
+    const failure = await onChangePassword(account.id, current, clearing ? "" : next);
+    setBusy(false);
+    if (failure) setError(failure);
+    else onClose();
+  }
+
+  return (
+    <div style={{ marginTop: 12, padding: "12px 13px", background: "#0d1219", border: "1px solid #1f2734", borderRadius: 9 }}>
+      {existing && (
+        <input
+          value={current}
+          type="password"
+          placeholder="current password"
+          onChange={(e) => setCurrent(e.target.value)}
+          style={{ ...S.input, marginBottom: 8 }}
+        />
+      )}
+      <input
+        value={next}
+        type="password"
+        placeholder={existing ? "new password" : `new password (${MIN_PASSWORD_LENGTH}+ characters)`}
+        onChange={(e) => setNext(e.target.value)}
+        style={S.input}
+      />
+      <input
+        value={confirm}
+        type="password"
+        placeholder="confirm new password"
+        onChange={(e) => setConfirm(e.target.value)}
+        onKeyDown={(e) => { if (e.key === "Enter") apply(false); }}
+        style={{ ...S.input, marginTop: 8 }}
+      />
+      {error && <div style={{ ...S.mono, fontSize: 10.5, color: "#f85149", marginTop: 8 }}>{error}</div>}
+      <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+        <button disabled={busy} onClick={() => apply(false)} style={{ ...S.ghostBtn, color: "#3fb950", borderColor: "#3fb95044" }}>
+          {busy ? <Loader2 size={12} className="spin" /> : <Check size={12} />} {existing ? "change" : "set password"}
+        </button>
+        {existing && (
+          <button disabled={busy} onClick={() => apply(true)} style={S.ghostBtn}>remove password</button>
+        )}
+        <button onClick={onClose} style={S.ghostBtn}>cancel</button>
+      </div>
+    </div>
+  );
+}
+
+function AccountsScreen({ accounts, activeId, onUse, onCreate, onRename, onRecolour, onDelete, onChangePassword, onHome }) {
   const [adding, setAdding] = useState(false);
   const [newName, setNewName] = useState("");
   const [newColour, setNewColour] = useState(PROFILE_COLOURS[1]);
   const [editingId, setEditingId] = useState(null);
   const [editName, setEditName] = useState("");
   const [confirmId, setConfirmId] = useState(null);
+  const [passwordId, setPasswordId] = useState(null);
+  const [newPassword, setNewPassword] = useState("");
+  const [newConfirm, setNewConfirm] = useState("");
+  const secure = cryptoAvailable();
+  const newPwProblem = secure ? passwordProblem(newPassword, newConfirm) : null;
+  const canCreate = cleanName(newName).length > 0 && !newPwProblem;
 
   const ranked = [...accounts].sort((a, b) => (b.progress.xp || 0) - (a.progress.xp || 0));
 
@@ -1503,6 +1833,7 @@ function AccountsScreen({ accounts, activeId, onUse, onCreate, onRename, onRecol
                   ) : (
                     <div style={{ ...S.display, fontSize: 15, color: "#e6edf3", display: "flex", alignItems: "center", gap: 8 }}>
                       {acc.name}
+                      {hasPassword(acc) && <Lock size={12} color="#7d8590" />}
                       {isActive && (
                         <span style={{ ...S.mono, fontSize: 9.5, color: acc.colour, border: `1px solid ${acc.colour}55`, borderRadius: 5, padding: "1px 5px" }}>
                           playing
@@ -1528,6 +1859,15 @@ function AccountsScreen({ accounts, activeId, onUse, onCreate, onRename, onRecol
                   >
                     <Pencil size={12} />
                   </button>
+                  {secure && (
+                    <button
+                      onClick={() => setPasswordId(passwordId === acc.id ? null : acc.id)}
+                      title={hasPassword(acc) ? "change password" : "set password"}
+                      style={{ ...S.ghostBtn, padding: "6px 8px", color: passwordId === acc.id ? "#f2cc60" : "#7d8590" }}
+                    >
+                      <Lock size={12} />
+                    </button>
+                  )}
                   <button
                     onClick={() => setConfirmId(confirmId === acc.id ? null : acc.id)}
                     title="delete"
@@ -1542,6 +1882,14 @@ function AccountsScreen({ accounts, activeId, onUse, onCreate, onRename, onRecol
                 <span style={{ ...S.mono, fontSize: 10, color: "#4b5563" }}>colour</span>
                 <ColourPicker value={acc.colour} onPick={(c) => onRecolour(acc.id, c)} />
               </div>
+
+              {passwordId === acc.id && (
+                <PasswordPanel
+                  account={acc}
+                  onChangePassword={onChangePassword}
+                  onClose={() => setPasswordId(null)}
+                />
+              )}
 
               {confirmId === acc.id && (
                 <div style={{ marginTop: 12, padding: "10px 12px", background: "rgba(248,81,73,0.07)", border: "1px solid rgba(248,81,73,0.3)", borderRadius: 9 }}>
@@ -1573,17 +1921,40 @@ function AccountsScreen({ accounts, activeId, onUse, onCreate, onRename, onRecol
             maxLength={MAX_NAME_LENGTH}
             placeholder="display name"
             onChange={(e) => setNewName(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter" && cleanName(newName)) { onCreate(newName, newColour); setAdding(false); setNewName(""); } }}
             style={S.input}
           />
+          {secure && (
+            <>
+              <input
+                value={newPassword}
+                type="password"
+                placeholder={`password (${MIN_PASSWORD_LENGTH}+ characters)`}
+                onChange={(e) => setNewPassword(e.target.value)}
+                style={{ ...S.input, marginTop: 8 }}
+              />
+              <input
+                value={newConfirm}
+                type="password"
+                placeholder="confirm password"
+                onChange={(e) => setNewConfirm(e.target.value)}
+                style={{ ...S.input, marginTop: 8 }}
+              />
+              {(newPassword || newConfirm) && newPwProblem && (
+                <div style={{ ...S.mono, fontSize: 10.5, color: "#f85149", marginTop: 8 }}>{newPwProblem}</div>
+              )}
+            </>
+          )}
           <div style={{ marginTop: 12 }}>
             <ColourPicker value={newColour} onPick={setNewColour} />
           </div>
           <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
             <button
-              disabled={!cleanName(newName)}
-              onClick={() => { onCreate(newName, newColour); setAdding(false); setNewName(""); }}
-              style={{ ...S.primaryBtn("#3fb950"), flex: 1, opacity: cleanName(newName) ? 1 : 0.4 }}
+              disabled={!canCreate}
+              onClick={() => {
+                onCreate(newName, newColour, secure ? newPassword : "");
+                setAdding(false); setNewName(""); setNewPassword(""); setNewConfirm("");
+              }}
+              style={{ ...S.primaryBtn("#3fb950"), flex: 1, opacity: canCreate ? 1 : 0.4 }}
             >
               <Check size={14} /> create
             </button>
@@ -1603,9 +1974,10 @@ function AccountsScreen({ accounts, activeId, onUse, onCreate, onRename, onRecol
 /*  LEADERBOARD — this device, plus an optional shared board           */
 /* ------------------------------------------------------------------ */
 
-function LeaderboardScreen({ accounts, activeId, config, entries, loading, error, publishedAt, onRefresh, onPublish, onSaveConfig, onHome }) {
+function LeaderboardScreen({ accounts, activeId, config, entries, loading, error, publishedAt, onRefresh, onPublish, onExport, onSaveConfig, onHome }) {
   const configured = isConfigured(config);
-  const [tab, setTab] = useState(configured ? "global" : "device");
+  const usingFile = fileEnabled(config);
+  const [tab, setTab] = useState(configured || usingFile ? "global" : "device");
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   const deviceRows = rankEntries(
@@ -1643,20 +2015,27 @@ function LeaderboardScreen({ accounts, activeId, config, entries, loading, error
           <Users size={13} /> this device
         </button>
         <button
-          onClick={() => { setTab("global"); if (configured) onRefresh(); }}
+          onClick={() => { setTab("global"); onRefresh(); }}
           style={{ ...S.ghostBtn, color: tab === "global" ? "#f2cc60" : "#7d8590", borderColor: tab === "global" ? "#f2cc6055" : "#232b36" }}
         >
-          <Globe size={13} /> global
+          <Globe size={13} /> shared
         </button>
         <div style={{ flex: 1 }} />
-        {tab === "global" && configured && (
+        {tab === "global" && (configured || usingFile) && (
           <>
             <button onClick={onRefresh} style={S.ghostBtn} title="refresh">
               <RefreshCw size={13} className={loading ? "spin" : ""} /> refresh
             </button>
-            <button onClick={onPublish} style={{ ...S.ghostBtn, color: "#3fb950", borderColor: "#3fb95044" }}>
-              <Upload size={13} /> publish my score
-            </button>
+            {configured && (
+              <button onClick={onPublish} style={{ ...S.ghostBtn, color: "#3fb950", borderColor: "#3fb95044" }}>
+                <Upload size={13} /> publish
+              </button>
+            )}
+            {usingFile && (
+              <button onClick={onExport} style={{ ...S.ghostBtn, color: "#56d4dd", borderColor: "#56d4dd44" }} title="download a leaderboard.json including your score">
+                <FileText size={13} /> download .json
+              </button>
+            )}
           </>
         )}
         <button
@@ -1671,15 +2050,25 @@ function LeaderboardScreen({ accounts, activeId, config, entries, loading, error
         <LeaderboardSettings config={config} onSave={onSaveConfig} onClose={() => setSettingsOpen(false)} />
       )}
 
-      {tab === "global" && !configured && (
-        <div style={{ ...S.panel, padding: "18px 18px 20px", marginBottom: 14 }}>
-          <div style={{ ...S.display, fontSize: 14, color: "#e6edf3", marginBottom: 8 }}>No shared board connected</div>
+      {tab === "global" && (
+        <div style={{ ...S.mono, fontSize: 10.5, color: "#4b5563", marginBottom: 12, lineHeight: 1.6 }}>
+          reading{" "}
+          {usingFile && <span style={{ color: "#56d4dd" }}>{config.filePath || DEFAULT_CONFIG.filePath}</span>}
+          {usingFile && configured && " + "}
+          {configured && <span style={{ color: "#f2cc60" }}>shared table</span>}
+          {!usingFile && !configured && <span style={{ color: "#f85149" }}>nothing — both sources are off</span>}
+        </div>
+      )}
+
+      {tab === "global" && usingFile && !configured && (
+        <div style={{ ...S.panel, padding: "16px 18px 18px", marginBottom: 14 }}>
+          <div style={{ ...S.display, fontSize: 14, color: "#e6edf3", marginBottom: 8 }}>Sharing through the JSON file</div>
           <div style={{ ...S.mono, fontSize: 11.5, color: "#7d8590", lineHeight: 1.6 }}>
-            This app is served as static files, so scores can only be shared through a database you
-            control. Open <span style={{ color: "#f2cc60" }}>setup</span> and paste a Supabase project
-            URL and anon key — the SQL to create the table is in{" "}
-            <span style={{ color: "#56d4dd" }}>lib/leaderboard.js</span>. Until then, the device board
-            below works offline.
+            Scores come from <span style={{ color: "#56d4dd" }}>{config.filePath || DEFAULT_CONFIG.filePath}</span>,
+            which ships with the site. A static host cannot write to it, so use{" "}
+            <span style={{ color: "#56d4dd" }}>download .json</span> to get a copy that includes your
+            score and commit it to the repo. For scores that appear without a commit, add a database
+            under <span style={{ color: "#f2cc60" }}>setup</span>.
           </div>
         </div>
       )}
@@ -1696,7 +2085,7 @@ function LeaderboardScreen({ accounts, activeId, config, entries, loading, error
         </div>
       )}
 
-      {tab === "global" && configured && loading && !rows.length ? (
+      {tab === "global" && loading && !rows.length ? (
         <div style={{ ...S.mono, fontSize: 12, color: "#7d8590", padding: "20px 2px" }}>loading scores …</div>
       ) : rows.length === 0 ? (
         <div style={{ ...S.mono, fontSize: 12, color: "#4b5563", padding: "20px 2px" }}>
@@ -1747,6 +2136,8 @@ function LeaderboardSettings({ config, onSave, onClose }) {
   const [key, setKey] = useState(config.key || "");
   const [table, setTable] = useState(config.table || DEFAULT_CONFIG.table);
   const [autoPublish, setAutoPublish] = useState(config.autoPublish !== false);
+  const [useFile, setUseFile] = useState(config.useFile !== false);
+  const [filePath, setFilePath] = useState(config.filePath || DEFAULT_CONFIG.filePath);
   const [showKey, setShowKey] = useState(false);
 
   return (
@@ -1756,12 +2147,29 @@ function LeaderboardSettings({ config, onSave, onClose }) {
         <button onClick={onClose} style={{ ...S.ghostBtn, padding: "4px 7px" }}><X size={12} /></button>
       </div>
 
-      <div style={{ ...S.mono, fontSize: 11, color: "#7d8590", lineHeight: 1.6, marginBottom: 14 }}>
-        Point the app at a Supabase table to share scores between devices. Both values stay in this
-        browser and are sent only to that project. Anyone using the page can post a score, so treat
-        the board as friendly rather than authoritative.
+      <div style={{ ...S.mono, fontSize: 11, color: "#7d8590", lineHeight: 1.6, marginBottom: 16 }}>
+        Two sources, usable together. The JSON file ships with the site and needs no setup but is
+        updated by committing a new copy. A Supabase table updates live. Everything here stays in
+        this browser.
       </div>
 
+      <div style={{ ...S.mono, fontSize: 10.5, color: "#56d4dd", letterSpacing: 0.5, marginBottom: 8 }}>JSON FILE</div>
+      <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10, cursor: "pointer", ...S.mono, fontSize: 11.5, color: "#c9d1d9" }}>
+        <input type="checkbox" checked={useFile} onChange={(e) => setUseFile(e.target.checked)} />
+        read scores from a JSON file
+      </label>
+      <input
+        value={filePath}
+        onChange={(e) => setFilePath(e.target.value)}
+        placeholder="leaderboard.json"
+        disabled={!useFile}
+        style={{ ...S.input, opacity: useFile ? 1 : 0.45 }}
+      />
+      <div style={{ ...S.mono, fontSize: 10, color: "#4b5563", marginTop: 6, marginBottom: 18 }}>
+        relative to the site root · fetched fresh on every refresh
+      </div>
+
+      <div style={{ ...S.mono, fontSize: 10.5, color: "#f2cc60", letterSpacing: 0.5, marginBottom: 8 }}>DATABASE (OPTIONAL)</div>
       <div style={{ ...S.mono, fontSize: 10.5, color: "#7d8590", marginBottom: 6 }}>PROJECT URL</div>
       <input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://xxxx.supabase.co" style={S.input} />
 
@@ -1792,17 +2200,23 @@ function LeaderboardSettings({ config, onSave, onClose }) {
 
       <div style={{ display: "flex", gap: 8, marginTop: 16 }}>
         <button
-          onClick={() => { onSave({ url: url.trim(), key: key.trim(), table: table.trim() || DEFAULT_CONFIG.table, autoPublish }); onClose(); }}
+          onClick={() => {
+            onSave({
+              url: url.trim(), key: key.trim(), table: table.trim() || DEFAULT_CONFIG.table,
+              autoPublish, useFile, filePath: filePath.trim() || DEFAULT_CONFIG.filePath,
+            });
+            onClose();
+          }}
           style={{ ...S.primaryBtn("#f2cc60"), flex: 1 }}
         >
           <Check size={14} /> save
         </button>
         {(config.url || config.key) && (
           <button
-            onClick={() => { onSave({ ...DEFAULT_CONFIG, autoPublish }); setUrl(""); setKey(""); onClose(); }}
+            onClick={() => { onSave({ ...DEFAULT_CONFIG, autoPublish, useFile, filePath }); setUrl(""); setKey(""); onClose(); }}
             style={{ ...S.ghostBtn, justifyContent: "center", flex: 1 }}
           >
-            disconnect
+            disconnect database
           </button>
         )}
       </div>
