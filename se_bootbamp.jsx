@@ -4,7 +4,7 @@ import {
   FolderGit2, Braces, ChevronRight, RotateCcw, Trophy, Zap, Activity,
   CheckCircle2, XCircle, Lock, Star, ArrowLeft, Sparkles, Clock, Check,
   Settings, Eye, EyeOff, Upload, FileText, X, Loader2,
-  Users, UserPlus, Crown, Trash2, RefreshCw, Pencil, Medal
+  Users, UserPlus, Crown, Trash2, RefreshCw, Pencil, Medal, Database
 } from "lucide-react";
 import { levelForXp, MAX_LEVEL } from "./lib/levels.js";
 import {
@@ -15,9 +15,9 @@ import {
   cryptoAvailable, MIN_PASSWORD_LENGTH,
 } from "./lib/accounts.js";
 import {
-  loadLeaderboardConfig, saveLeaderboardConfig, isConfigured, fileEnabled,
-  fetchScores, fetchFileScores, publishScore, entryForAccount, rankEntries,
-  mergeEntries, downloadFile, DEFAULT_CONFIG,
+  loadLeaderboardConfig, saveLeaderboardConfig, isConfigured, fileEnabled, dbEnabled,
+  fetchScores, fetchFileScores, fetchDbScores, publishScore, entryForAccount,
+  rankEntries, mergeEntries, downloadFile, downloadDb, DEFAULT_CONFIG,
 } from "./lib/leaderboard.js";
 import { programmingFundamentalsNodes } from "./questions/programming-fundamentals.js";
 import { objectOrientedParadigmNodes } from "./questions/object-oriented-paradigm.js";
@@ -472,6 +472,7 @@ export default function SEBootcamp() {
     const cfg = config || lbConfig;
     const sources = [];
     if (fileEnabled(cfg)) sources.push(["file", fetchFileScores(cfg)]);
+    if (dbEnabled(cfg)) sources.push(["data.db", fetchDbScores(cfg)]);
     if (isConfigured(cfg)) sources.push(["shared table", fetchScores(cfg)]);
     if (!sources.length) {
       setLbEntries([]);
@@ -646,11 +647,26 @@ export default function SEBootcamp() {
     refreshLeaderboard();
   }
 
-  function exportLeaderboard() {
+  /* The board you can see, plus your own score, in whichever format you ask for.
+     Both carry the same rows so the two files stay mirrors of each other. */
+  function boardWithMyScore() {
     const mine = account
       ? [entryForAccount(account, accountStats(account), levelForXp(accountStats(account).xp))]
       : [];
-    downloadFile(mergeEntries(lbEntries, mine), (lbConfig.filePath || "leaderboard.json").split("/").pop());
+    return mergeEntries(lbEntries, mine);
+  }
+
+  function exportLeaderboard() {
+    downloadFile(boardWithMyScore(), (lbConfig.filePath || DEFAULT_CONFIG.filePath).split("/").pop());
+  }
+
+  async function exportLeaderboardDb() {
+    try {
+      setLbError(null);
+      await downloadDb(boardWithMyScore(), (lbConfig.dbPath || DEFAULT_CONFIG.dbPath).split("/").pop());
+    } catch (e) {
+      setLbError(e && e.message ? e.message : "Could not build data.db");
+    }
   }
 
   if (!ready) {
@@ -752,6 +768,7 @@ export default function SEBootcamp() {
           onRefresh={() => refreshLeaderboard()}
           onPublish={() => publishMyScore()}
           onExport={exportLeaderboard}
+          onExportDb={exportLeaderboardDb}
           onSaveConfig={saveLbSettings}
           onHome={backHome}
         />
@@ -1974,10 +1991,11 @@ function AccountsScreen({ accounts, activeId, onUse, onCreate, onRename, onRecol
 /*  LEADERBOARD — this device, plus an optional shared board           */
 /* ------------------------------------------------------------------ */
 
-function LeaderboardScreen({ accounts, activeId, config, entries, loading, error, publishedAt, onRefresh, onPublish, onExport, onSaveConfig, onHome }) {
+function LeaderboardScreen({ accounts, activeId, config, entries, loading, error, publishedAt, onRefresh, onPublish, onExport, onExportDb, onSaveConfig, onHome }) {
   const configured = isConfigured(config);
   const usingFile = fileEnabled(config);
-  const [tab, setTab] = useState(configured || usingFile ? "global" : "device");
+  const usingDb = dbEnabled(config);
+  const [tab, setTab] = useState(configured || usingFile || usingDb ? "global" : "device");
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   const deviceRows = rankEntries(
@@ -2021,7 +2039,7 @@ function LeaderboardScreen({ accounts, activeId, config, entries, loading, error
           <Globe size={13} /> shared
         </button>
         <div style={{ flex: 1 }} />
-        {tab === "global" && (configured || usingFile) && (
+        {tab === "global" && (configured || usingFile || usingDb) && (
           <>
             <button onClick={onRefresh} style={S.ghostBtn} title="refresh">
               <RefreshCw size={13} className={loading ? "spin" : ""} /> refresh
@@ -2031,11 +2049,12 @@ function LeaderboardScreen({ accounts, activeId, config, entries, loading, error
                 <Upload size={13} /> publish
               </button>
             )}
-            {usingFile && (
-              <button onClick={onExport} style={{ ...S.ghostBtn, color: "#56d4dd", borderColor: "#56d4dd44" }} title="download a leaderboard.json including your score">
-                <FileText size={13} /> download .json
-              </button>
-            )}
+            <button onClick={onExport} style={{ ...S.ghostBtn, color: "#56d4dd", borderColor: "#56d4dd44" }} title="download leaderboard.json including your score">
+              <FileText size={13} /> .json
+            </button>
+            <button onClick={onExportDb} style={{ ...S.ghostBtn, color: "#d2a8ff", borderColor: "#d2a8ff44" }} title="download the same board as a SQLite data.db">
+              <Database size={13} /> .db
+            </button>
           </>
         )}
         <button
@@ -2053,22 +2072,26 @@ function LeaderboardScreen({ accounts, activeId, config, entries, loading, error
       {tab === "global" && (
         <div style={{ ...S.mono, fontSize: 10.5, color: "#4b5563", marginBottom: 12, lineHeight: 1.6 }}>
           reading{" "}
-          {usingFile && <span style={{ color: "#56d4dd" }}>{config.filePath || DEFAULT_CONFIG.filePath}</span>}
-          {usingFile && configured && " + "}
-          {configured && <span style={{ color: "#f2cc60" }}>shared table</span>}
-          {!usingFile && !configured && <span style={{ color: "#f85149" }}>nothing — both sources are off</span>}
+          {[
+            usingFile && <span key="f" style={{ color: "#56d4dd" }}>{config.filePath || DEFAULT_CONFIG.filePath}</span>,
+            usingDb && <span key="d" style={{ color: "#d2a8ff" }}>{config.dbPath || DEFAULT_CONFIG.dbPath}</span>,
+            configured && <span key="t" style={{ color: "#f2cc60" }}>shared table</span>,
+          ].filter(Boolean).reduce((out, item, i) => (i ? [...out, " + ", item] : [item]), [])}
+          {!usingFile && !usingDb && !configured && <span style={{ color: "#f85149" }}>nothing — every source is off</span>}
         </div>
       )}
 
       {tab === "global" && usingFile && !configured && (
         <div style={{ ...S.panel, padding: "16px 18px 18px", marginBottom: 14 }}>
-          <div style={{ ...S.display, fontSize: 14, color: "#e6edf3", marginBottom: 8 }}>Sharing through the JSON file</div>
+          <div style={{ ...S.display, fontSize: 14, color: "#e6edf3", marginBottom: 8 }}>Sharing through the shipped files</div>
           <div style={{ ...S.mono, fontSize: 11.5, color: "#7d8590", lineHeight: 1.6 }}>
             Scores come from <span style={{ color: "#56d4dd" }}>{config.filePath || DEFAULT_CONFIG.filePath}</span>,
-            which ships with the site. A static host cannot write to it, so use{" "}
-            <span style={{ color: "#56d4dd" }}>download .json</span> to get a copy that includes your
-            score and commit it to the repo. For scores that appear without a commit, add a database
-            under <span style={{ color: "#f2cc60" }}>setup</span>.
+            mirrored as SQLite in <span style={{ color: "#d2a8ff" }}>{config.dbPath || DEFAULT_CONFIG.dbPath}</span>.
+            A static host cannot write to either, so download the board in whichever format you keep
+            and commit it — then run{" "}
+            <span style={{ color: "#c9d1d9" }}>tools/sync_leaderboard.py</span> so both files match.
+            For scores that appear without a commit, add a database under{" "}
+            <span style={{ color: "#f2cc60" }}>setup</span>.
           </div>
         </div>
       )}
@@ -2138,6 +2161,8 @@ function LeaderboardSettings({ config, onSave, onClose }) {
   const [autoPublish, setAutoPublish] = useState(config.autoPublish !== false);
   const [useFile, setUseFile] = useState(config.useFile !== false);
   const [filePath, setFilePath] = useState(config.filePath || DEFAULT_CONFIG.filePath);
+  const [useDb, setUseDb] = useState(Boolean(config.useDb));
+  const [dbPath, setDbPath] = useState(config.dbPath || DEFAULT_CONFIG.dbPath);
   const [showKey, setShowKey] = useState(false);
 
   return (
@@ -2167,6 +2192,23 @@ function LeaderboardSettings({ config, onSave, onClose }) {
       />
       <div style={{ ...S.mono, fontSize: 10, color: "#4b5563", marginTop: 6, marginBottom: 18 }}>
         relative to the site root · fetched fresh on every refresh
+      </div>
+
+      <div style={{ ...S.mono, fontSize: 10.5, color: "#d2a8ff", letterSpacing: 0.5, marginBottom: 8 }}>SQLITE MIRROR</div>
+      <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10, cursor: "pointer", ...S.mono, fontSize: 11.5, color: "#c9d1d9" }}>
+        <input type="checkbox" checked={useDb} onChange={(e) => setUseDb(e.target.checked)} />
+        also read scores from data.db
+      </label>
+      <input
+        value={dbPath}
+        onChange={(e) => setDbPath(e.target.value)}
+        placeholder="data.db"
+        disabled={!useDb}
+        style={{ ...S.input, opacity: useDb ? 1 : 0.45 }}
+      />
+      <div style={{ ...S.mono, fontSize: 10, color: "#4b5563", marginTop: 6, marginBottom: 18, lineHeight: 1.5 }}>
+        the same rows as the JSON file, as real SQLite · reading it downloads a WebAssembly
+        copy of SQLite the first time, so leave it off unless you want it
       </div>
 
       <div style={{ ...S.mono, fontSize: 10.5, color: "#f2cc60", letterSpacing: 0.5, marginBottom: 8 }}>DATABASE (OPTIONAL)</div>
@@ -2203,7 +2245,9 @@ function LeaderboardSettings({ config, onSave, onClose }) {
           onClick={() => {
             onSave({
               url: url.trim(), key: key.trim(), table: table.trim() || DEFAULT_CONFIG.table,
-              autoPublish, useFile, filePath: filePath.trim() || DEFAULT_CONFIG.filePath,
+              autoPublish,
+              useFile, filePath: filePath.trim() || DEFAULT_CONFIG.filePath,
+              useDb, dbPath: dbPath.trim() || DEFAULT_CONFIG.dbPath,
             });
             onClose();
           }}
@@ -2213,7 +2257,7 @@ function LeaderboardSettings({ config, onSave, onClose }) {
         </button>
         {(config.url || config.key) && (
           <button
-            onClick={() => { onSave({ ...DEFAULT_CONFIG, autoPublish, useFile, filePath }); setUrl(""); setKey(""); onClose(); }}
+            onClick={() => { onSave({ ...DEFAULT_CONFIG, autoPublish, useFile, filePath, useDb, dbPath }); setUrl(""); setKey(""); onClose(); }}
             style={{ ...S.ghostBtn, justifyContent: "center", flex: 1 }}
           >
             disconnect database
