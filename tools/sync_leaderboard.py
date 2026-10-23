@@ -58,10 +58,11 @@ def normalise(entry):
     for column in COLUMNS:
         value = entry.get(column)
         if column in INTEGER_COLUMNS:
+            default = 1 if column == "level" else 0
             try:
-                row[column] = int(value or 0)
+                row[column] = int(value) if value not in (None, "") else default
             except (TypeError, ValueError):
-                row[column] = 0
+                row[column] = default
         elif column == "name":
             row[column] = str(value or "player")
         elif column == "player_id":

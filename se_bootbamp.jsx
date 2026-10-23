@@ -16,8 +16,9 @@ import {
 } from "./lib/accounts.js";
 import {
   loadLeaderboardConfig, saveLeaderboardConfig, isConfigured, fileEnabled, dbEnabled,
-  fetchScores, fetchFileScores, fetchDbScores, publishScore, entryForAccount,
-  rankEntries, mergeEntries, downloadFile, downloadDb, DEFAULT_CONFIG,
+  fetchScores, fetchFileScores, fetchDbScores, entryForAccount,
+  rankEntries, mergeEntries, downloadFile, downloadDb, recordScore, loadLocalBoard,
+  DEFAULT_CONFIG,
 } from "./lib/leaderboard.js";
 import { programmingFundamentalsNodes } from "./questions/programming-fundamentals.js";
 import { objectOrientedParadigmNodes } from "./questions/object-oriented-paradigm.js";
@@ -232,25 +233,24 @@ async function generateAiQuestions(apiKey, mod, node, count, syllabusText) {
   return qs;
 }
 
-/* Unlocked profiles are remembered for the tab, not saved — closing the tab
-   or reopening the site asks for the password again. */
-const UNLOCK_SESSION_KEY = "se-bootcamp-unlocked";
+/* Who is signed in is remembered for the tab, not saved — closing the tab or
+   reopening the site returns to the login screen. */
+const SESSION_KEY = "se-bootcamp-session";
 
-function loadUnlocked() {
+function loadSession() {
   try {
-    const raw = sessionStorage.getItem(UNLOCK_SESSION_KEY);
-    const parsed = raw ? JSON.parse(raw) : [];
-    return Array.isArray(parsed) ? parsed : [];
+    return sessionStorage.getItem(SESSION_KEY) || null;
   } catch (e) {
-    return [];
+    return null;
   }
 }
 
-function rememberUnlocked(ids) {
+function rememberSession(id) {
   try {
-    sessionStorage.setItem(UNLOCK_SESSION_KEY, JSON.stringify(ids));
+    if (id) sessionStorage.setItem(SESSION_KEY, id);
+    else sessionStorage.removeItem(SESSION_KEY);
   } catch (e) {
-    /* unlock state stays in memory for this session */
+    /* the session stays in memory for this tab */
   }
 }
 
@@ -270,8 +270,8 @@ export default function SEBootcamp() {
   const [activeNode, setActiveNode] = useState(null);
   const [leveledUp, setLeveledUp] = useState(null);
 
-  // which profiles have been unlocked this browsing session
-  const [unlocked, setUnlocked] = useState(loadUnlocked);
+  // who is signed in on this tab
+  const [sessionId, setSessionId] = useState(loadSession);
   const [unlockError, setUnlockError] = useState(null);
   const [unlockBusy, setUnlockBusy] = useState(false);
 
@@ -281,6 +281,7 @@ export default function SEBootcamp() {
   const [lbLoading, setLbLoading] = useState(false);
   const [lbError, setLbError] = useState(null);
   const [lbPublishedAt, setLbPublishedAt] = useState(null);
+  const [lbWrite, setLbWrite] = useState(null); // what the last write reached
 
   // quiz-in-progress state
   const [qIndex, setQIndex] = useState(0);
@@ -388,31 +389,56 @@ export default function SEBootcamp() {
     persistAccounts(setProgress(state, state.activeId, nextProgress));
   }, [persistAccounts]);
 
-  function markUnlocked(id) {
-    setUnlocked((prev) => {
-      if (prev.includes(id)) return prev;
-      const next = [...prev, id];
-      rememberUnlocked(next);
-      return next;
-    });
+  function signIn(id) {
+    rememberSession(id);
+    setSessionId(id);
   }
 
+  function signOut() {
+    rememberSession(null);
+    setSessionId(null);
+    setActiveModule(null);
+    setActiveNode(null);
+    setScreen("home");
+  }
+
+  /* Registering writes the new player straight onto the board: the browser's
+     own copy, then leaderboard.json and data.db through the write endpoint when
+     the site is served somewhere that can write, then the shared table. */
   async function createAccount(name, colour, password) {
     const auth = password ? await hashPassword(password) : null;
     const next = addAccount(accountsRef.current, name, colour, auth);
     persistAccounts(next);
-    markUnlocked(next.activeId);
+    signIn(next.activeId);
     setScreen("home");
+
+    const account = next.accounts.find((a) => a.id === next.activeId);
+    if (account) registerOnBoard(account);
+  }
+
+  async function registerOnBoard(account) {
+    const stats = accountStats(account);
+    try {
+      const result = await recordScore(lbConfig, entryForAccount(account, stats, levelForXp(stats.xp)));
+      setLbEntries((prev) => mergeEntries(prev, result.board));
+      setLbWrite(result);
+      if (result.table === "failed" && result.error) setLbError(result.error);
+    } catch (e) {
+      setLbError(e && e.message ? e.message : "Could not record that score");
+    }
   }
 
   /* Switching only changes who is active; a profile with a password then meets
      the lock screen before any of its progress is shown. */
   function switchToAccount(id) {
+    const target = accountsRef.current.accounts.find((a) => a.id === id);
     persistAccounts(switchAccount(accountsRef.current, id));
     setActiveModule(null);
     setActiveNode(null);
     setUnlockError(null);
     setScreen("home");
+    if (target && !hasPassword(target)) signIn(id);
+    else { rememberSession(null); setSessionId(null); }
   }
 
   async function unlockAccount(id, password) {
@@ -422,8 +448,8 @@ export default function SEBootcamp() {
     setUnlockError(null);
     try {
       if (await verifyPassword(password, target.auth)) {
-        markUnlocked(id);
-        if (accountsRef.current.activeId !== id) switchToAccount(id);
+        if (accountsRef.current.activeId !== id) persistAccounts(switchAccount(accountsRef.current, id));
+        signIn(id);
       } else {
         setUnlockError("That password does not match");
       }
@@ -443,7 +469,7 @@ export default function SEBootcamp() {
     }
     const auth = next ? await hashPassword(next) : null;
     persistAccounts(setAccountAuth(accountsRef.current, id, auth));
-    markUnlocked(id);
+    signIn(id);
     return null;
   }
 
@@ -475,14 +501,14 @@ export default function SEBootcamp() {
     if (dbEnabled(cfg)) sources.push(["data.db", fetchDbScores(cfg)]);
     if (isConfigured(cfg)) sources.push(["shared table", fetchScores(cfg)]);
     if (!sources.length) {
-      setLbEntries([]);
+      setLbEntries(loadLocalBoard());
       return;
     }
     setLbLoading(true);
     setLbError(null);
     try {
       const settled = await Promise.allSettled(sources.map(([, p]) => p));
-      const lists = [];
+      const lists = [loadLocalBoard()];
       const failures = [];
       settled.forEach((result, i) => {
         if (result.status === "fulfilled") lists.push(result.value);
@@ -495,20 +521,23 @@ export default function SEBootcamp() {
     }
   }, [lbConfig]);
 
+  /* Sends the current score everywhere it can go — the browser's board, the
+     JSON and SQLite files through the write endpoint, and the shared table. */
   const publishMyScore = useCallback(async (config, who) => {
     const cfg = config || lbConfig;
     const target = who || activeAccount(accountsRef.current);
-    if (!isConfigured(cfg) || !target) return;
+    if (!target) return;
     const stats = accountStats(target);
     try {
-      await publishScore(cfg, entryForAccount(target, stats, levelForXp(stats.xp)));
+      const result = await recordScore(cfg, entryForAccount(target, stats, levelForXp(stats.xp)));
+      setLbEntries((prev) => mergeEntries(prev, result.board));
+      setLbWrite(result);
       setLbPublishedAt(Date.now());
-      setLbError(null);
-      refreshLeaderboard(cfg);
+      setLbError(result.table === "failed" ? result.error : null);
     } catch (e) {
-      setLbError(e && e.message ? e.message : "Could not publish your score");
+      setLbError(e && e.message ? e.message : "Could not record your score");
     }
-  }, [lbConfig, refreshLeaderboard]);
+  }, [lbConfig]);
 
   function openTree(mod) {
     setActiveModule(mod);
@@ -621,7 +650,7 @@ export default function SEBootcamp() {
     const after = levelForXp(next.xp);
     setLeveledUp(after.number > before.number ? after : null);
     persist(next);
-    if (account && lbConfig.autoPublish && isConfigured(lbConfig)) {
+    if (account && lbConfig.autoPublish !== false) {
       publishMyScore(lbConfig, { ...account, progress: next });
     }
     setScreen("result");
@@ -677,29 +706,21 @@ export default function SEBootcamp() {
     );
   }
 
-  /* No profile yet (first visit, or every profile deleted) — ask for one before
-     any progress can be recorded against it. */
-  if (!account) {
+  /* Nothing of a profile's progress is shown until someone signs in. The login
+     screen covers both cases: no profiles yet (register one) and profiles that
+     exist but have not been opened in this tab. */
+  if (!account || sessionId !== account.id) {
     return (
       <div style={S.appShell}>
-        <OnboardingScreen onCreate={createAccount} />
-      </div>
-    );
-  }
-
-  /* The active profile is password-protected and has not been unlocked in this
-     tab, so nothing of its progress is rendered until it is. */
-  if (hasPassword(account) && !unlocked.includes(account.id)) {
-    return (
-      <div style={S.appShell}>
-        <LockScreen
-          account={account}
-          others={accounts.accounts.filter((a) => a.id !== account.id)}
+        <LoginScreen
+          accounts={accounts.accounts}
+          selectedId={accounts.activeId}
           error={unlockError}
           busy={unlockBusy}
-          onUnlock={(password) => unlockAccount(account.id, password)}
-          onPick={switchToAccount}
-          onForget={() => { deleteAccount(account.id); setUnlockError(null); }}
+          onSelect={(id) => { setUnlockError(null); switchToAccount(id); }}
+          onSignIn={unlockAccount}
+          onRegister={createAccount}
+          onForget={(id) => { deleteAccount(id); setUnlockError(null); }}
         />
       </div>
     );
@@ -732,6 +753,7 @@ export default function SEBootcamp() {
           onOpen={openTree}
           onAccounts={() => setScreen("accounts")}
           onLeaderboard={openLeaderboard}
+          onSignOut={signOut}
           onReset={resetProgress}
           apiKey={apiKey}
           aiMode={aiMode}
@@ -765,6 +787,7 @@ export default function SEBootcamp() {
           loading={lbLoading}
           error={lbError}
           publishedAt={lbPublishedAt}
+          write={lbWrite}
           onRefresh={() => refreshLeaderboard()}
           onPublish={() => publishMyScore()}
           onExport={exportLeaderboard}
@@ -823,7 +846,7 @@ export default function SEBootcamp() {
 /*  HOME — commit-graph module map                                     */
 /* ------------------------------------------------------------------ */
 
-function HomeScreen({ progress, account, profileCount, onOpen, onAccounts, onLeaderboard, onReset, apiKey, aiMode, onSaveApiKey, onToggleAiMode, syllabusName, syllabusText, onSaveSyllabus, onClearSyllabus }) {
+function HomeScreen({ progress, account, profileCount, onOpen, onAccounts, onLeaderboard, onSignOut, onReset, apiKey, aiMode, onSaveApiKey, onToggleAiMode, syllabusName, syllabusText, onSaveSyllabus, onClearSyllabus }) {
   const lvl = levelForXp(progress.xp);
   const y11 = MODULES.filter((m) => m.year === 11);
   const y12 = MODULES.filter((m) => m.year === 12);
@@ -907,6 +930,9 @@ function HomeScreen({ progress, account, profileCount, onOpen, onAccounts, onLea
         </button>
         <button onClick={onAccounts} style={{ ...S.ghostBtn, color: "#56d4dd", borderColor: "#2d3542" }}>
           <Users size={13} /> profiles{profileCount > 1 ? ` (${profileCount})` : ""}
+        </button>
+        <button onClick={onSignOut} style={{ ...S.ghostBtn, borderColor: "#2d3542" }}>
+          <Lock size={13} /> sign out
         </button>
       </div>
 
@@ -1527,32 +1553,47 @@ function ColourPicker({ value, onPick }) {
   );
 }
 
-function OnboardingScreen({ onCreate }) {
-  const [name, setName] = useState("");
-  const [colour, setColour] = useState(PROFILE_COLOURS[0]);
+/**
+ * The way into the app. Nothing of a profile's progress is rendered until
+ * someone signs in here: pick a profile and, if it has a password, enter it.
+ * With no profiles saved yet it opens straight on the register form, and
+ * registering puts the new player on the leaderboard immediately.
+ */
+function LoginScreen({ accounts, selectedId, error, busy, onSelect, onSignIn, onRegister, onForget }) {
+  const [mode, setMode] = useState(accounts.length ? "signin" : "register");
   const [password, setPassword] = useState("");
+  const [confirmForget, setConfirmForget] = useState(false);
+
+  // register form
+  const [name, setName] = useState("");
+  const [newPassword, setNewPassword] = useState("");
   const [confirm, setConfirm] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState(null);
+  const [colour, setColour] = useState(PROFILE_COLOURS[0]);
+  const [registering, setRegistering] = useState(false);
+  const [registerError, setRegisterError] = useState(null);
 
   const secure = cryptoAvailable();
-  const pwProblem = secure ? passwordProblem(password, confirm) : null;
-  const ready = cleanName(name).length > 0 && !pwProblem && !busy;
+  const selected = accounts.find((a) => a.id === selectedId) || null;
+  const ranked = [...accounts].sort((a, b) => (b.lastPlayed || 0) - (a.lastPlayed || 0));
+  const pwProblem = secure ? passwordProblem(newPassword, confirm) : null;
+  const canRegister = cleanName(name).length > 0 && !pwProblem && !registering;
 
-  async function submit() {
-    if (!ready) return;
-    setBusy(true);
-    setError(null);
+  useEffect(() => { setPassword(""); setConfirmForget(false); }, [selectedId]);
+
+  async function register() {
+    if (!canRegister) return;
+    setRegistering(true);
+    setRegisterError(null);
     try {
-      await onCreate(name, colour, secure ? password : "");
+      await onRegister(name, colour, secure ? newPassword : "");
     } catch (e) {
-      setError(e && e.message ? e.message : "Could not create that profile");
-      setBusy(false);
+      setRegisterError(e && e.message ? e.message : "Could not create that profile");
+      setRegistering(false);
     }
   }
 
   return (
-    <div style={{ maxWidth: 420, margin: "0 auto", padding: "80px 20px 60px" }}>
+    <div style={{ maxWidth: 430, margin: "0 auto", padding: "64px 20px 60px" }}>
       <div style={{ ...S.mono, fontSize: 12, color: "#56d4dd", letterSpacing: 1.5, marginBottom: 6 }}>
         ~/nesa/software-engineering-11-12
       </div>
@@ -1560,167 +1601,170 @@ function OnboardingScreen({ onCreate }) {
         <GitBranch size={26} color="#56d4dd" strokeWidth={2.2} />
         se<span style={{ color: "#3fb950" }}>//</span>bootcamp
       </h1>
-      <div style={{ ...S.mono, fontSize: 12.5, color: "#7d8590", marginBottom: 22 }}>
-        Create a profile to track your XP, levels and cleared nodes.
+      <div style={{ ...S.mono, fontSize: 12.5, color: "#7d8590", marginBottom: 24 }}>
+        {mode === "register"
+          ? "Register a player to track XP, levels and cleared nodes."
+          : "Sign in to pick up where you left off."}
       </div>
 
-      <div style={{ ...S.panel, padding: "20px 20px 22px" }}>
-        <div style={{ ...S.mono, fontSize: 11, color: "#7d8590", marginBottom: 8 }}>DISPLAY NAME</div>
-        <input
-          value={name}
-          autoFocus
-          maxLength={MAX_NAME_LENGTH}
-          onChange={(e) => setName(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
-          placeholder="e.g. ada"
-          style={S.input}
-        />
-        <div style={{ ...S.mono, fontSize: 10.5, color: "#4b5563", margin: "8px 0 18px" }}>
-          Shown on the leaderboard · up to {MAX_NAME_LENGTH} characters
-        </div>
-
-        {secure && (
-          <>
-            <div style={{ ...S.mono, fontSize: 11, color: "#7d8590", marginBottom: 8 }}>PASSWORD</div>
-            <input
-              value={password}
-              type="password"
-              onChange={(e) => setPassword(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
-              placeholder={`at least ${MIN_PASSWORD_LENGTH} characters`}
-              style={S.input}
-            />
-            <input
-              value={confirm}
-              type="password"
-              onChange={(e) => setConfirm(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
-              placeholder="confirm password"
-              style={{ ...S.input, marginTop: 8 }}
-            />
-            <div style={{ ...S.mono, fontSize: 10.5, color: password || confirm ? (pwProblem ? "#f85149" : "#3fb950") : "#4b5563", margin: "8px 0 18px" }}>
-              {password || confirm ? (pwProblem || "passwords match") : "needed to open this profile later"}
-            </div>
-          </>
-        )}
-
-        <div style={{ ...S.mono, fontSize: 11, color: "#7d8590", marginBottom: 8 }}>COLOUR</div>
-        <ColourPicker value={colour} onPick={setColour} />
-
-        {error && (
-          <div style={{ ...S.mono, fontSize: 11, color: "#f85149", marginTop: 14 }}>{error}</div>
-        )}
-
-        <button
-          disabled={!ready}
-          onClick={submit}
-          style={{ ...S.primaryBtn("#3fb950"), width: "100%", marginTop: 20, opacity: ready ? 1 : 0.4, cursor: ready ? "pointer" : "not-allowed" }}
-        >
-          {busy ? <Loader2 size={15} className="spin" /> : <UserPlus size={15} />}
-          {busy ? "creating …" : "create profile"}
-        </button>
-        <div style={{ ...S.mono, fontSize: 10.5, color: "#4b5563", marginTop: 12, lineHeight: 1.5 }}>
-          {secure
-            ? "Saved in this browser only. The password keeps other people here out of your profile, but it is not encryption and there is no way to recover it."
-            : "Passwords need a secure page (https or localhost), so this profile will open without one."}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function LockScreen({ account, others, error, busy, onUnlock, onPick, onForget }) {
-  const [password, setPassword] = useState("");
-  const [showOthers, setShowOthers] = useState(false);
-  const [confirmForget, setConfirmForget] = useState(false);
-
-  useEffect(() => { setPassword(""); }, [account.id]);
-
-  return (
-    <div style={{ maxWidth: 400, margin: "0 auto", padding: "80px 20px 60px" }}>
-      <div style={{ ...S.mono, fontSize: 12, color: "#56d4dd", letterSpacing: 1.5, marginBottom: 20 }}>
-        ~/nesa/software-engineering-11-12
-      </div>
-
-      <div style={{ ...S.panel, padding: "24px 22px" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20 }}>
-          <Avatar account={account} size={46} />
-          <div>
-            <div style={{ ...S.display, fontSize: 17, color: "#e6edf3" }}>{account.name}</div>
-            <div style={{ ...S.mono, fontSize: 11, color: "#7d8590", display: "flex", alignItems: "center", gap: 5, marginTop: 2 }}>
-              <Lock size={11} /> locked
-            </div>
+      {mode === "signin" ? (
+        <div style={{ ...S.panel, padding: "18px 18px 20px" }}>
+          <div style={{ ...S.mono, fontSize: 11, color: "#7d8590", marginBottom: 10, display: "flex", alignItems: "center", gap: 6 }}>
+            <Users size={12} /> CHOOSE A PLAYER
           </div>
-        </div>
 
-        <input
-          value={password}
-          type="password"
-          autoFocus
-          onChange={(e) => setPassword(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter" && password && !busy) onUnlock(password); }}
-          placeholder="password"
-          style={S.input}
-        />
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {ranked.map((acc) => {
+              const stats = accountStats(acc);
+              const lvl = levelForXp(stats.xp);
+              const isSelected = acc.id === selectedId;
+              return (
+                <button
+                  key={acc.id}
+                  onClick={() => onSelect(acc.id)}
+                  style={{
+                    display: "flex", alignItems: "center", gap: 11, width: "100%", textAlign: "left",
+                    padding: "10px 12px", borderRadius: 10, cursor: "pointer",
+                    background: isSelected ? `${acc.colour}14` : "#0d1219",
+                    border: `1px solid ${isSelected ? `${acc.colour}66` : "#1f2734"}`,
+                  }}
+                >
+                  <Avatar account={acc} size={34} />
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ ...S.display, fontSize: 14, color: "#e6edf3", display: "flex", alignItems: "center", gap: 7 }}>
+                      {acc.name}
+                      {hasPassword(acc) && <Lock size={11} color="#7d8590" />}
+                    </div>
+                    <div style={{ ...S.mono, fontSize: 10.5, color: "#7d8590", marginTop: 2 }}>
+                      lvl {lvl.number} {lvl.title} · {stats.xp} XP
+                    </div>
+                  </div>
+                  {isSelected && <ChevronRight size={15} color={acc.colour} />}
+                </button>
+              );
+            })}
+          </div>
 
-        {error && (
-          <div style={{ ...S.mono, fontSize: 11, color: "#f85149", marginTop: 10 }}>{error}</div>
-        )}
-
-        <button
-          disabled={!password || busy}
-          onClick={() => onUnlock(password)}
-          style={{ ...S.primaryBtn(account.colour), width: "100%", marginTop: 16, opacity: password && !busy ? 1 : 0.4 }}
-        >
-          {busy ? <Loader2 size={15} className="spin" /> : <Check size={15} />}
-          {busy ? "checking …" : "unlock"}
-        </button>
-
-        <div style={{ display: "flex", gap: 10, marginTop: 14, justifyContent: "space-between" }}>
-          {others.length > 0 && (
-            <button
-              onClick={() => setShowOthers((v) => !v)}
-              style={{ ...S.mono, fontSize: 11, color: "#7d8590", background: "none", border: "none", cursor: "pointer", padding: 0 }}
-            >
-              use another profile
-            </button>
+          {selected && hasPassword(selected) && (
+            <div style={{ marginTop: 14 }}>
+              <input
+                value={password}
+                type="password"
+                autoFocus
+                onChange={(e) => setPassword(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter" && password && !busy) onSignIn(selected.id, password); }}
+                placeholder={`password for ${selected.name}`}
+                style={S.input}
+              />
+              {error && <div style={{ ...S.mono, fontSize: 11, color: "#f85149", marginTop: 9 }}>{error}</div>}
+              <button
+                disabled={!password || busy}
+                onClick={() => onSignIn(selected.id, password)}
+                style={{ ...S.primaryBtn(selected.colour), width: "100%", marginTop: 12, opacity: password && !busy ? 1 : 0.4 }}
+              >
+                {busy ? <Loader2 size={15} className="spin" /> : <Check size={15} />}
+                {busy ? "checking …" : "sign in"}
+              </button>
+              <button
+                onClick={() => setConfirmForget((v) => !v)}
+                style={{ ...S.mono, fontSize: 10.5, color: "#4b5563", background: "none", border: "none", cursor: "pointer", padding: "10px 0 0" }}
+              >
+                forgot password?
+              </button>
+              {confirmForget && (
+                <div style={{ marginTop: 8, padding: "11px 12px", background: "rgba(248,81,73,0.07)", border: "1px solid rgba(248,81,73,0.3)", borderRadius: 9 }}>
+                  <div style={{ ...S.mono, fontSize: 10.5, color: "#f85149", lineHeight: 1.5, marginBottom: 9 }}>
+                    There is no reset — no email, no recovery. The only way past it is deleting this
+                    profile, which loses its XP and cleared nodes.
+                  </div>
+                  <button onClick={() => onForget(selected.id)} style={{ ...S.ghostBtn, color: "#f85149", borderColor: "rgba(248,81,73,0.4)" }}>
+                    <Trash2 size={12} /> delete {selected.name}
+                  </button>
+                </div>
+              )}
+            </div>
           )}
+
           <button
-            onClick={() => setConfirmForget((v) => !v)}
-            style={{ ...S.mono, fontSize: 11, color: "#4b5563", background: "none", border: "none", cursor: "pointer", padding: 0 }}
+            onClick={() => { setMode("register"); setRegisterError(null); }}
+            style={{ ...S.ghostBtn, width: "100%", justifyContent: "center", marginTop: 14, padding: "10px 12px" }}
           >
-            forgot password?
+            <UserPlus size={13} /> register a new player
           </button>
         </div>
-
-        {showOthers && (
-          <div style={{ marginTop: 14, borderTop: "1px solid #1f2734", paddingTop: 14, display: "flex", flexDirection: "column", gap: 8 }}>
-            {others.map((other) => (
-              <button
-                key={other.id}
-                onClick={() => onPick(other.id)}
-                style={{ ...S.ghostBtn, justifyContent: "flex-start", gap: 10, padding: "8px 10px" }}
-              >
-                <Avatar account={other} size={24} />
-                <span style={{ color: "#c9d1d9" }}>{other.name}</span>
-                {hasPassword(other) && <Lock size={11} color="#4b5563" />}
-              </button>
-            ))}
+      ) : (
+        <div style={{ ...S.panel, padding: "18px 18px 20px" }}>
+          <div style={{ ...S.mono, fontSize: 11, color: "#7d8590", marginBottom: 8 }}>DISPLAY NAME</div>
+          <input
+            value={name}
+            autoFocus
+            maxLength={MAX_NAME_LENGTH}
+            onChange={(e) => setName(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") register(); }}
+            placeholder="e.g. ada"
+            style={S.input}
+          />
+          <div style={{ ...S.mono, fontSize: 10.5, color: "#4b5563", margin: "8px 0 16px" }}>
+            shown on the leaderboard · up to {MAX_NAME_LENGTH} characters
           </div>
-        )}
 
-        {confirmForget && (
-          <div style={{ marginTop: 14, padding: "11px 12px", background: "rgba(248,81,73,0.07)", border: "1px solid rgba(248,81,73,0.3)", borderRadius: 9 }}>
-            <div style={{ ...S.mono, fontSize: 11, color: "#f85149", lineHeight: 1.5, marginBottom: 10 }}>
-              Nothing here can recover the password — no email, no reset. The only way past it is to
-              delete this profile and start again, which loses its XP and cleared nodes.
-            </div>
-            <button onClick={onForget} style={{ ...S.ghostBtn, color: "#f85149", borderColor: "rgba(248,81,73,0.4)" }}>
-              <Trash2 size={12} /> delete {account.name}
+          {secure && (
+            <>
+              <div style={{ ...S.mono, fontSize: 11, color: "#7d8590", marginBottom: 8 }}>PASSWORD</div>
+              <input
+                value={newPassword}
+                type="password"
+                onChange={(e) => setNewPassword(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") register(); }}
+                placeholder={`at least ${MIN_PASSWORD_LENGTH} characters`}
+                style={S.input}
+              />
+              <input
+                value={confirm}
+                type="password"
+                onChange={(e) => setConfirm(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") register(); }}
+                placeholder="confirm password"
+                style={{ ...S.input, marginTop: 8 }}
+              />
+              <div style={{ ...S.mono, fontSize: 10.5, color: newPassword || confirm ? (pwProblem ? "#f85149" : "#3fb950") : "#4b5563", margin: "8px 0 16px" }}>
+                {newPassword || confirm ? (pwProblem || "passwords match") : "needed to sign in later"}
+              </div>
+            </>
+          )}
+
+          <div style={{ ...S.mono, fontSize: 11, color: "#7d8590", marginBottom: 8 }}>COLOUR</div>
+          <ColourPicker value={colour} onPick={setColour} />
+
+          {registerError && (
+            <div style={{ ...S.mono, fontSize: 11, color: "#f85149", marginTop: 14 }}>{registerError}</div>
+          )}
+
+          <button
+            disabled={!canRegister}
+            onClick={register}
+            style={{ ...S.primaryBtn("#3fb950"), width: "100%", marginTop: 18, opacity: canRegister ? 1 : 0.4 }}
+          >
+            {registering ? <Loader2 size={15} className="spin" /> : <UserPlus size={15} />}
+            {registering ? "registering …" : "register and play"}
+          </button>
+
+          {accounts.length > 0 && (
+            <button
+              onClick={() => setMode("signin")}
+              style={{ ...S.ghostBtn, width: "100%", justifyContent: "center", marginTop: 10 }}
+            >
+              <ArrowLeft size={13} /> back to sign in
             </button>
+          )}
+
+          <div style={{ ...S.mono, fontSize: 10.5, color: "#4b5563", marginTop: 14, lineHeight: 1.5 }}>
+            {secure
+              ? "Registering adds you to the leaderboard straight away. Profiles live in this browser; the password keeps others here out of yours, but it is not encryption and cannot be recovered."
+              : "Passwords need a secure page (https or localhost), so this profile will open without one."}
           </div>
-        )}
-      </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1991,7 +2035,7 @@ function AccountsScreen({ accounts, activeId, onUse, onCreate, onRename, onRecol
 /*  LEADERBOARD — this device, plus an optional shared board           */
 /* ------------------------------------------------------------------ */
 
-function LeaderboardScreen({ accounts, activeId, config, entries, loading, error, publishedAt, onRefresh, onPublish, onExport, onExportDb, onSaveConfig, onHome }) {
+function LeaderboardScreen({ accounts, activeId, config, entries, loading, error, publishedAt, write, onRefresh, onPublish, onExport, onExportDb, onSaveConfig, onHome }) {
   const configured = isConfigured(config);
   const usingFile = fileEnabled(config);
   const usingDb = dbEnabled(config);
@@ -2102,9 +2146,15 @@ function LeaderboardScreen({ accounts, activeId, config, entries, loading, error
         </div>
       )}
 
-      {tab === "global" && configured && publishedAt && !error && (
-        <div style={{ ...S.mono, fontSize: 11, color: "#3fb950", marginBottom: 12 }}>
-          score published {new Date(publishedAt).toLocaleTimeString()}
+      {tab === "global" && write && (
+        <div style={{ ...S.mono, fontSize: 11, color: write.files === "written" ? "#3fb950" : "#7d8590", marginBottom: 12, lineHeight: 1.6 }}>
+          last score written · this browser{write.files === "written" ? " · leaderboard.json + data.db" : ""}
+          {write.table === "published" ? " · shared table" : ""}
+          {write.files !== "written" && (
+            <span style={{ color: "#4b5563" }}>
+              {" "}· files not writable here, run <span style={{ color: "#c9d1d9" }}>python3 tools/serve.py</span> to update them
+            </span>
+          )}
         </div>
       )}
 
